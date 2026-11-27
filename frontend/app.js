@@ -351,12 +351,21 @@ async function poll() {
 }
 el("refresh").onclick=refresh;
 el("about-version").textContent=el("app-version").textContent;
-for (const link of document.querySelectorAll(".header-link")) {
+for (const link of document.querySelectorAll('a[aria-haspopup="dialog"]')) {
   link.onclick=event=>{
     event.preventDefault();
+    if (link.getAttribute("aria-controls") === "node-ports-dialog") setText(el("node-ports-status"), "");
     el(link.getAttribute("aria-controls")).showModal();
   };
 }
+el("copy-node-ports").onclick=async()=>{
+  try {
+    await window.runtime.ClipboardSetText(await api.ClashNodePortsScript());
+    setText(el("node-ports-status"), "脚本已复制");
+  } catch (e) {
+    setText(el("node-ports-status"), "复制失败，请使用发布包里的 integrations/clash/node-ports.js");
+  }
+};
 el("about-project").onclick=event=>{
   event.preventDefault();
   window.runtime.BrowserOpenURL(event.currentTarget.href);

@@ -40,6 +40,16 @@ DNS 查询默认通过上游 SOCKS5 使用 TCP。只有当前会话的 UDP 探�
 
 点击 **停止代理** 可单独停止这台虚拟机的会话。要查看连接的目标地址、DNS 查询或失败原因，展开窗口底部的 **活动日志**。
 
+## 用 FlClash 或 Clash Verge Rev 给每台虚拟机指定节点
+
+在宿主机的 Clash 客户端加载订阅。GuestGate 的「上游 SOCKS5」旁有「为虚拟机指定 Clash 节点」入口，可直接复制脚本。发布包也附带同一份 [节点端口脚本](integrations/clash/node-ports.js)。
+
+1. **应用到目标订阅。** FlClash 中右键目标配置，打开「扩展」并选择「脚本」。在「前往配置脚本」中导入文件或新建并粘贴脚本，返回选中它，点「立即应用」。Clash Verge Rev 中右键目标订阅，打开「扩展脚本」或「编辑脚本」，粘贴并保存。启用目标配置并使用规则模式。[FlClash 扩展脚本](https://github.com/chen08209/FlClash/blob/main/lib/views/profiles/extend/script.dart) · [Clash Verge Rev 扩展脚本](https://www.clashverge.dev/guide/extend.html)
+2. **查看端口。** 在客户端的「端口对照」代理组查看映射。脚本按订阅中 `proxies` 的顺序从 `18901` 开始分配，仅在宿主机的 `127.0.0.1` 上监听。如果端口已被占用，可改脚本开头的 `startPort`。仅含 `proxy-providers` 的订阅不会生成端口。
+3. **填写每台虚拟机的上游 SOCKS5。** 例如虚拟机 A 填 `127.0.0.1:18901`，虚拟机 B 填 `127.0.0.1:18902`。分别启用代理并核对出口 IP。订阅更新改变了节点顺序时，请重新查看「端口对照」。
+
+脚本会把目标配置的分流规则替换为全部走「主出口」。如需继续使用原分流规则，请将脚本应用到单独的配置副本。
+
 ## 从源码构建
 
 使用 `go.mod` 指定的 Go 版本，并将 GNU windres 加入 PATH。在项目目录运行以下 PowerShell 命令即可测试并生成 `GuestGate.exe`。
@@ -48,6 +58,8 @@ DNS 查询默认通过上游 SOCKS5 使用 TCP。只有当前会话的 UDP 探�
 go test ./...
 .\scripts\build-windows.ps1
 ```
+
+运行 `.\scripts\build-windows.ps1 -Package` 可在 `dist` 中生成带版本号的 Windows 发布包，内含节点端口脚本。
 
 ## 许可证
 

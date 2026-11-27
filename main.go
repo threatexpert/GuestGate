@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"os"
 	"sync"
@@ -20,6 +21,11 @@ import (
 
 // Keep the public Wails binding at window.go.main.App.
 type App struct{ *desktop.App }
+
+//go:embed integrations/clash/node-ports.js
+var clashNodePortsScript string
+
+func (*App) ClashNodePortsScript() string { return clashNodePortsScript }
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--manager" {

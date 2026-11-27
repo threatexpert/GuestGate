@@ -21,6 +21,16 @@
 <p class="guide-result"><strong>可靠性闭环：</strong> GuestGate 是虚拟机通往外部的唯一桥梁。无论代理服务停止、程序意外退出还是上游节点故障，桥梁断开即刻彻底断网。</p>
 <form method="dialog" class="guide-actions"><button class="primary" autofocus>关闭</button></form>
 </dialog>
+<dialog id="node-ports-dialog" class="app-dialog" aria-labelledby="node-ports-title">
+<h2 id="node-ports-title">如何为每个 Clash 节点分配独立本地端口</h2>
+<ol class="guide-body">
+  <li>在宿主机运行 FlClash 或 Clash Verge Rev，并启用含有节点的订阅。</li>
+  <li><strong>FlClash</strong>：右键目标配置，打开「扩展」并选择「脚本」。在「前往配置脚本」中新建脚本、粘贴并保存，返回选中它，点「立即应用」。<br><strong>Clash Verge Rev</strong>：右键目标订阅，打开「扩展脚本」（部分版本叫「编辑脚本」），粘贴并保存。启用该订阅并切到规则模式。</li>
+  <li>在客户端的「端口对照」代理组查看节点对应的端口。例如，虚拟机 A 的上游 SOCKS5 填 <code>127.0.0.1:18901</code>，虚拟机 B 填 <code>127.0.0.1:18902</code>。分别启用代理并核对出口 IP。</li>
+</ol>
+<p class="guide-result">脚本会把这份配置的分流规则替换为全部走「主出口」。端口按节点顺序分配，订阅更新后请重新核对。</p>
+<form method="dialog" class="guide-actions node-ports-actions"><span id="node-ports-status" role="status"></span><button type="button" id="copy-node-ports" class="primary">复制脚本</button><button>关闭</button></form>
+</dialog>
 <main class="workspace">
 <aside class="sidebar" aria-labelledby="machine-title">
 <div class="sidebar-head"><h2 id="machine-title">虚拟机</h2>
@@ -39,7 +49,7 @@
 <p class="path" id="encrypted-note" hidden>此虚拟机已加密。启用时将自动读取 Windows 为它保存的密码。</p>
 <div class="network" id="network"></div>
 <form id="settings"><div class="fields">
-<label>上游 SOCKS5<input name="proxy" autocomplete="off" spellcheck="false" placeholder="host:port 或 socks5://用户:密码@host:port"></label>
+<div class="proxy-field"><div class="proxy-heading"><label for="proxy-address">上游 SOCKS5</label><a href="#node-ports-dialog" aria-haspopup="dialog" aria-controls="node-ports-dialog">为虚拟机指定 Clash 节点</a></div><input id="proxy-address" name="proxy" autocomplete="off" spellcheck="false" placeholder="host:port 或 socks5://用户:密码@host:port"></div>
 <label>DNS 服务器<input name="dns" autocomplete="off" spellcheck="false" placeholder="可留空，默认使用 8.8.8.8"></label>
 <label id="rest-label" hidden>VMware REST 密码<input name="rest" type="password" autocomplete="off"></label>
 </div><label class="host-policy"><input type="checkbox" name="blockHost" checked>启用严格隔离模式（不勾选则使用仅主机模式）</label>
