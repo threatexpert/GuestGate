@@ -134,6 +134,15 @@ func (m *manager) prepare(ctx context.Context, cfg Config, p *setupProgress) (VM
 		if v.Reason != "" {
 			return v, "", errors.New(v.Reason)
 		}
+		if err := v.prepareControl(); err != nil {
+			return v, "", err
+		}
+		if v.Encrypted {
+			p.activity.add("GuestGate", "已使用 Windows 保存的凭据验证加密虚拟机")
+		}
+		if v.controlShell != 0 {
+			p.activity.add("GuestGate", "已使用当前用户的普通权限连接 VMware 虚拟机")
+		}
 		dns, err := DNSAddress(cfg.DNS)
 		if err != nil {
 			return v, "", err
@@ -145,7 +154,7 @@ func (m *manager) prepare(ctx context.Context, cfg Config, p *setupProgress) (VM
 			}
 			if err = m.isolatedNetwork(&v, vms, false); err != nil {
 				if v.IsOwnNetwork {
-					_, disconnectErr := command(v.vmrun, "disconnectNamedDevice", v.Path, v.device)
+					_, disconnectErr := v.vmCommand("disconnectNamedDevice", v.Path, v.device)
 					err = errors.Join(err, disconnectErr)
 				}
 				return v, "", err
@@ -178,10 +187,24 @@ func (m *manager) prepare(ctx context.Context, cfg Config, p *setupProgress) (VM
 		if v.isolated {
 			p.step(selectNetwork, "active", "正在连接专用隔离网络 "+v.Network)
 			if err = switchIsolated(ctx, v, cfg.RESTPassword); err != nil {
+				if strings.Contains(strings.ToLower(err.Error()), "not powered on") {
+					listing, listErr := v.vmCommand("list")
+					if listErr != nil {
+						return v, "", fmt.Errorf("隔离网络切换未完成（%s）：%w；复查运行列表失败：%v", v.vmrun, err, listErr)
+					}
+					status := "运行列表中已找不到所选虚拟机"
+					for _, path := range strings.Split(listing, "\n") {
+						if strings.EqualFold(strings.TrimSpace(path), v.Path) {
+							status = "运行列表中仍有该虚拟机，但 VMware 拒绝了运行时操作"
+							break
+						}
+					}
+					return v, "", fmt.Errorf("隔离网络切换未完成（%s）：%s。%w", v.vmrun, status, err)
+				}
 				return v, "", fmt.Errorf("隔离网络切换未完成: %w", err)
 			}
 			if err = m.isolatedNetwork(&v, vms, true); err != nil {
-				_, disconnectErr := command(v.vmrun, "disconnectNamedDevice", v.Path, v.device)
+				_, disconnectErr := v.vmCommand("disconnectNamedDevice", v.Path, v.device)
 				return v, "", errors.Join(err, disconnectErr)
 			}
 			p.step(selectNetwork, "done", "已接入隔离网络（"+strings.Replace(v.Network, "vmnet", "VMnet", 1)+"）。虚拟机无法访问宿主机端口，上网必须通过代理。")
@@ -209,6 +232,9 @@ func (m *manager) run(ctx context.Context, cfg Config, p *setupProgress, probe <
 		return err
 	}
 	v, dev, err := m.prepare(ctx, cfg, p)
+	if v.controlShell != 0 {
+		defer windows.CloseHandle(v.controlShell)
+	}
 	if err != nil {
 		return err
 	}

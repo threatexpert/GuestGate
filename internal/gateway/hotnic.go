@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,7 +20,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -120,7 +120,7 @@ type vmREST struct {
 
 const vmMedia = "application/vnd.vmware.vmw.rest-v1+json"
 
-func (r vmREST) call(ctx context.Context, method, path string, body, out any) error {
+func (r vmREST) call(ctx context.Context, method, path, vmPassword string, body, out any) error {
 	var data bytes.Buffer
 	if body != nil {
 		if err := json.NewEncoder(&data).Encode(body); err != nil {
@@ -132,10 +132,20 @@ func (r vmREST) call(ctx context.Context, method, path string, body, out any) er
 		return err
 	}
 	req.SetBasicAuth(r.user, r.pass)
+	if vmPassword != "" {
+		q := req.URL.Query()
+		q.Set("vmPassword", base64.StdEncoding.EncodeToString([]byte(vmPassword)))
+		req.URL.RawQuery = q.Encode()
+	}
 	req.Header.Set("Accept", vmMedia)
 	req.Header.Set("Content-Type", vmMedia)
 	resp, err := r.client.Do(req)
 	if err != nil {
+		// net/http wraps transport failures with the full request URL.
+		var requestErr *url.Error
+		if errors.As(err, &requestErr) {
+			return fmt.Errorf("VMware REST %s %s: %w", method, path, requestErr.Err)
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -156,7 +166,7 @@ type restNIC struct {
 
 func (r vmREST) switchNIC(ctx context.Context, v VM) error {
 	var vms []restVM
-	if err := r.call(ctx, "GET", "vms", nil, &vms); err != nil {
+	if err := r.call(ctx, "GET", "vms", "", nil, &vms); err != nil {
 		return err
 	}
 	var target restVM
@@ -167,7 +177,7 @@ func (r vmREST) switchNIC(ctx context.Context, v VM) error {
 		}
 	}
 	if target.ID == "" {
-		if err := r.call(ctx, "POST", "vms/registration", map[string]string{"name": v.Name, "path": v.Path}, &target); err != nil {
+		if err := r.call(ctx, "POST", "vms/registration", "", map[string]string{"name": v.Name, "path": v.Path}, &target); err != nil {
 			return err
 		}
 		if target.ID == "" || !strings.EqualFold(filepath.Clean(target.Path), filepath.Clean(v.Path)) {
@@ -177,7 +187,7 @@ func (r vmREST) switchNIC(ctx context.Context, v VM) error {
 	nicPath := "vms/" + url.PathEscape(target.ID) + "/nic"
 	read := func() (restNIC, error) {
 		var list struct{ NICs []restNIC }
-		if err := r.call(ctx, "GET", nicPath, nil, &list); err != nil {
+		if err := r.call(ctx, "GET", nicPath, v.vmPassword, nil, &list); err != nil {
 			return restNIC{}, err
 		}
 		if len(list.NICs) != 1 {
@@ -199,7 +209,7 @@ func (r vmREST) switchNIC(ctx context.Context, v VM) error {
 		network = v.Network
 		params = map[string]string{"type": kind, "vmnet": strings.Replace(network, "vmnet", "VMnet", 1)}
 	}
-	if err = r.call(ctx, "PUT", nicPath+"/"+strconv.Itoa(nic.Index), params, nil); err != nil {
+	if err = r.call(ctx, "PUT", nicPath+"/"+strconv.Itoa(nic.Index), v.vmPassword, params, nil); err != nil {
 		return err
 	}
 	nic, err = read()
@@ -238,7 +248,7 @@ func switchHostOnly(parent context.Context, v VM, password string) error {
 	defer clean()
 	cmd := exec.CommandContext(ctx, vmrest, "-U", "-p", "-1")
 	cmd.Env = append(os.Environ(), "LOCALAPPDATA="+dir)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.SysProcAttr = vmProcessAttrs(v.controlShell)
 	if err = cmd.Start(); err != nil {
 		return err
 	}
@@ -250,7 +260,9 @@ func switchHostOnly(parent context.Context, v VM, password string) error {
 	}
 	transport := &http.Transport{DialContext: dial}
 	defer transport.CloseIdleConnections()
-	r := vmREST{&http.Client{Transport: transport, Timeout: 15 * time.Second}, user, pass}
+	r := vmREST{&http.Client{Transport: transport, Timeout: 15 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}, user, pass}
 	ticker := time.NewTicker(150 * time.Millisecond)
 	defer ticker.Stop()
 	for {

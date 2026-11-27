@@ -18,6 +18,10 @@ type Health struct {
 	CheckedAt         int64
 }
 
+func rootNSQuery() []byte {
+	return []byte{0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1}
+}
+
 // Check verifies the SOCKS listener independently of either path to the guest's
 // resolver. A UDP check must never succeed through the TCP DNS fallback.
 func (r *Relay) Check(parent context.Context, dns netip.Addr) Health {
@@ -30,18 +34,25 @@ func (r *Relay) Check(parent context.Context, dns netip.Addr) Health {
 		defer cancel()
 		target := netip.AddrPortFrom(dns, 53)
 		// Root NS query. Any matching DNS response proves a round trip.
-		query := []byte{0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1}
+		query := rootNSQuery()
 		var wg sync.WaitGroup
+		var tcpErr error
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := exchangeTCPDNS(ctx, r.tcp, target.String(), query)
-			h.TCP = pathResult(err)
+			_, tcpErr = exchangeTCPDNS(ctx, r.tcp, target.String(), query)
 		}()
-		_, err := r.exchange(ctx, target, query, false)
-		h.UDP = pathResult(err)
+		udpErr := r.ProbeUDP(ctx, target)
 		wg.Wait()
+		h.TCP, h.UDP = pathResult(tcpErr), pathResult(udpErr)
+		var timeout net.Error
+		if errors.As(udpErr, &timeout) && timeout.Timeout() && tcpErr == nil {
+			h.UDP.Detail = "UDP DNS 探测超时，TCP DNS 已验证可用"
+		}
 	} else {
+		r.mu.Lock()
+		r.verified = nil
+		r.mu.Unlock()
 		h.TCP, h.UDP = CheckResult{State: "blocked"}, CheckResult{State: "blocked"}
 	}
 	h.CheckedAt = time.Now().Unix()

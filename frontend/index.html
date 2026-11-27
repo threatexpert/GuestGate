@@ -2,7 +2,7 @@
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GuestGate</title><link rel="icon" href="guestgate.ico"><link rel="stylesheet" href="style.css"></head>
 <body><header class="appbar"><div class="brand"><span class="brandmark" aria-hidden="true"></span><div class="brand-copy">
-<div class="brand-title"><h1>GuestGate</h1><small id="app-version" class="brand-version">v1.0.1</small><a class="header-link" id="open-about" href="#about-dialog" aria-haspopup="dialog" aria-controls="about-dialog">关于</a></div>
+<div class="brand-title"><h1>GuestGate</h1><small id="app-version" class="brand-version">v1.0.2</small><a class="header-link" id="open-about" href="#about-dialog" aria-haspopup="dialog" aria-controls="about-dialog">关于</a></div>
 <p class="subtitle">VMware 虚拟机透明代理网关 · 客户机流量仅经 SOCKS5 出口，杜绝直连泄露 <a class="header-link" id="open-guide" href="#guide-dialog" aria-haspopup="dialog" aria-controls="guide-dialog">工作原理</a></p>
 </div></div></header>
 <dialog id="about-dialog" class="app-dialog" aria-labelledby="about-title">
@@ -36,6 +36,7 @@
 <details id="config" hidden open class="panel" aria-labelledby="selected-name">
 <summary class="config-head"><div><span class="context">虚拟机配置</span><h2 id="selected-name"></h2></div><span id="save-state" role="status"></span></summary>
 <p class="path" id="selected-path"></p>
+<p class="path" id="encrypted-note" hidden>此虚拟机已加密。启用时将自动读取 Windows 为它保存的密码。</p>
 <div class="network" id="network"></div>
 <form id="settings"><div class="fields">
 <label>上游 SOCKS5<input name="proxy" autocomplete="off" spellcheck="false" placeholder="host:port 或 socks5://用户:密码@host:port"></label>

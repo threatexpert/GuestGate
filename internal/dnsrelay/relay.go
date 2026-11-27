@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -16,7 +17,7 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// Each guest owns one DNS relay. Start negotiating on its first UDP DNS query.
+// Each guest owns one DNS relay. Only a probe can enable UDP forwarding.
 type Relay struct {
 	ctx    context.Context
 	server string
@@ -26,11 +27,11 @@ type Relay struct {
 	first  sync.Once
 	done   chan struct{}
 
-	mu      sync.Mutex
-	current *dnsAssociation
-	tcpOnly bool
-	lastErr error
-	changed chan struct{}
+	mu       sync.Mutex
+	current  *dnsAssociation
+	verified *dnsAssociation
+	lastErr  error
+	changed  chan struct{}
 }
 
 func New(ctx context.Context, server string, auth *proxy.Auth, tcp proxy.ContextDialer) *Relay {
@@ -42,7 +43,7 @@ func New(ctx context.Context, server string, auth *proxy.Auth, tcp proxy.Context
 func (r *Relay) publish(a *dnsAssociation, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.current, r.lastErr, r.tcpOnly = a, err, errors.Is(err, errUDPUnsupported)
+	r.current, r.lastErr, r.verified = a, err, nil
 	close(r.changed)
 	r.changed = make(chan struct{})
 }
@@ -88,39 +89,67 @@ func (r *Relay) run() {
 func (r *Relay) Done() <-chan struct{} { return r.done }
 
 func (r *Relay) Exchange(ctx context.Context, target netip.AddrPort, query []byte) ([]byte, error) {
-	return r.exchange(ctx, target, query, true)
-}
-
-func (r *Relay) exchange(ctx context.Context, target netip.AddrPort, query []byte, allowTCP bool) ([]byte, error) {
 	if len(query) < 12 || len(query) > 65535 {
 		return nil, errors.New("invalid DNS message length")
 	}
-	// Bound UDP setup and exchange together. TCP fallback uses the original query deadline.
-	udpCtx, cancelUDP := context.WithTimeout(ctx, 12*time.Second)
-	defer cancelUDP()
+	r.mu.Lock()
+	a := r.verified
+	r.mu.Unlock()
+	if a == nil {
+		return exchangeTCPDNS(ctx, r.tcp, target.String(), query)
+	}
+	udpCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	reply, udpErr := a.exchange(udpCtx, target, query)
+	cancel()
+	if udpErr == nil {
+		return reply, nil
+	}
+	if ctx.Err() != nil || r.ctx.Err() != nil {
+		return nil, udpErr
+	}
+	r.mu.Lock()
+	if r.verified == a {
+		r.verified = nil
+	}
+	r.mu.Unlock()
+	reply, tcpErr := exchangeTCPDNS(ctx, r.tcp, target.String(), query)
+	if tcpErr != nil {
+		return nil, fmt.Errorf("UDP DNS 转发失败（%v），TCP DNS 重试失败：%w", udpErr, tcpErr)
+	}
+	return reply, nil
+}
+
+// ProbeUDP verifies a DNS round trip on the current association. A successful
+// SOCKS5 handshake alone does not establish that UDP datagrams can get back.
+func (r *Relay) ProbeUDP(ctx context.Context, target netip.AddrPort) error {
 	r.first.Do(func() { close(r.demand) })
 	for {
 		r.mu.Lock()
-		a, tcpOnly, changed, err := r.current, r.tcpOnly, r.changed, r.lastErr
+		a, changed, err := r.current, r.changed, r.lastErr
 		r.mu.Unlock()
-		if !allowTCP && err != nil {
-			return nil, err
-		}
-		if tcpOnly {
-			return exchangeTCPDNS(ctx, r.tcp, target.String(), query)
+		if err != nil {
+			return err
 		}
 		if a != nil {
-			select {
-			case <-a.done:
-			default:
-				return a.exchange(udpCtx, target, query)
+			_, err = a.exchange(ctx, target, rootNSQuery())
+			r.mu.Lock()
+			if r.current == a {
+				if err == nil {
+					r.verified = a
+				} else {
+					r.verified = nil
+				}
+			} else if err == nil {
+				err = net.ErrClosed
 			}
+			r.mu.Unlock()
+			return err
 		}
 		select {
 		case <-r.ctx.Done():
-			return nil, r.ctx.Err()
-		case <-udpCtx.Done():
-			return nil, udpCtx.Err()
+			return r.ctx.Err()
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-changed:
 		}
 	}

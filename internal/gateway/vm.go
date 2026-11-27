@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,12 +15,16 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"guestgate/internal/workstation"
 )
 
 type nicBinding struct{ network, mac string }
 
 type VM struct {
+	Encrypted                                        bool
+	credentialGUID                                   string
+	vmPassword                                       string
 	GuestOSFamily                                    string
 	IsOwnNetwork, RESTConfigured                     bool
 	isolated                                         bool
@@ -34,18 +37,110 @@ type VM struct {
 	subnet                                           netip.Prefix
 	device                                           string
 	vmrun                                            string
+	controlShell                                     windows.Handle
 }
 
 func command(name string, args ...string) (string, error) {
+	return commandWithParent(0, name, args...)
+}
+
+func (v VM) vmCommand(args ...string) (string, error) {
+	if v.vmPassword != "" && len(args) >= 2 && args[1] == v.Path {
+		args = append([]string{"-vp", v.vmPassword}, args...)
+	}
+	return commandWithParent(v.controlShell, v.vmrun, args...)
+}
+
+// Workstation can enumerate a user's VMs from an elevated process while only
+// accepting runtime operations from the user's ordinary UAC session.
+func (v *VM) selectControlContext() error {
+	if !windows.GetCurrentProcessToken().IsElevated() && !v.Encrypted {
+		return nil
+	}
+	args := []string{"readVariable", v.Path, "runtimeConfig", v.device + ".connectionType"}
+	_, adminErr := v.vmCommand(args...)
+	if adminErr == nil {
+		return nil
+	}
+	if !windows.GetCurrentProcessToken().IsElevated() || !strings.Contains(strings.ToLower(adminErr.Error()), "not powered on") {
+		if v.Encrypted {
+			return adminErr
+		}
+		return nil
+	}
+	shell, err := ordinaryDesktopShell()
+	if err != nil {
+		return fmt.Errorf("管理员权限读取虚拟机失败：%w；无法取得同一账户的普通权限：%v", adminErr, err)
+	}
+	v.controlShell = shell
+	if _, err := v.vmCommand(args...); err != nil {
+		windows.CloseHandle(shell)
+		v.controlShell = 0
+		return fmt.Errorf("读取虚拟机运行时网卡失败。管理员权限：%w；普通权限：%v", adminErr, err)
+	}
+	return nil
+}
+
+// Starting a VMware tool with the ordinary desktop as parent inherits that
+// desktop's token and logon session. Only use a non-elevated shell of this user.
+func ordinaryDesktopShell() (windows.Handle, error) {
+	var pid uint32
+	if _, err := windows.GetWindowThreadProcessId(windows.GetShellWindow(), &pid); err != nil {
+		return 0, err
+	}
+	shell, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_CREATE_PROCESS|windows.PROCESS_DUP_HANDLE, false, pid)
+	if err != nil {
+		return 0, err
+	}
+	if err := verifyOrdinaryShell(shell); err != nil {
+		windows.CloseHandle(shell)
+		return 0, err
+	}
+	return shell, nil
+}
+
+func verifyOrdinaryShell(shell windows.Handle) error {
+	var token windows.Token
+	if err := windows.OpenProcessToken(shell, windows.TOKEN_QUERY, &token); err != nil {
+		return err
+	}
+	defer token.Close()
+	current, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return err
+	}
+	desktop, err := token.GetTokenUser()
+	if err != nil {
+		return err
+	}
+	if !current.User.Sid.Equals(desktop.User.Sid) || token.IsElevated() {
+		return errors.New("请用启动 VMware 的同一账户运行 GuestGate，并确保桌面以普通权限运行")
+	}
+	return nil
+}
+
+func commandWithParent(parent windows.Handle, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	c := exec.CommandContext(ctx, name, args...)
-	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	c.SysProcAttr = vmProcessAttrs(parent)
 	b, e := c.CombinedOutput()
 	if e != nil {
-		return "", fmt.Errorf("%s: %w %s", filepath.Base(name), e, strings.TrimSpace(string(b)))
+		detail := strings.TrimSpace(string(b))
+		if len(args) > 1 && args[0] == "-vp" {
+			detail = strings.ReplaceAll(detail, args[1], "[已隐藏]")
+		}
+		return "", fmt.Errorf("%s: %w %s", filepath.Base(name), e, detail)
 	}
 	return strings.TrimSpace(string(b)), nil
+}
+
+func vmProcessAttrs(parent windows.Handle) *syscall.SysProcAttr {
+	attrs := &syscall.SysProcAttr{HideWindow: true, ParentProcess: syscall.Handle(parent)}
+	if parent != 0 {
+		attrs.CreationFlags = windows.CREATE_NO_WINDOW
+	}
+	return attrs
 }
 func powershell(script string) (string, error) {
 	return command(filepath.Join(os.Getenv("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop';"+script)
@@ -53,13 +148,13 @@ func powershell(script string) (string, error) {
 
 // Reconnect only the selected NIC so an already running DHCP client can renew.
 func renewLink(v VM) error {
-	if _, err := command(v.vmrun, "disconnectNamedDevice", v.Path, v.device); err != nil {
+	if _, err := v.vmCommand("disconnectNamedDevice", v.Path, v.device); err != nil {
 		return err
 	}
 	time.Sleep(time.Second)
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		if _, err = command(v.vmrun, "connectNamedDevice", v.Path, v.device); err == nil {
+		if _, err = v.vmCommand("connectNamedDevice", v.Path, v.device); err == nil {
 			return nil
 		}
 		time.Sleep(time.Second)
@@ -132,12 +227,18 @@ func readVM(path string, eligible map[string]netip.Prefix) (VM, error) {
 		return v, err
 	}
 	fields := map[string]string{}
-	scan := bufio.NewScanner(strings.NewReader(string(b)))
-	for scan.Scan() {
-		k, val, ok := strings.Cut(scan.Text(), "=")
+	for line := range strings.SplitSeq(string(b), "\n") {
+		k, val, ok := strings.Cut(line, "=")
 		if ok {
 			fields[strings.ToLower(strings.TrimSpace(k))] = strings.Trim(strings.TrimSpace(val), "\"")
 		}
+	}
+	v.credentialGUID = fields["encryptedvm.guid"]
+	switch strings.ToLower(fields["vmx.encryptiontype"]) {
+	case "partial", "full":
+		v.Encrypted = true
+	default:
+		v.Encrypted = fields["encryption.keysafe"] != "" || fields["encryption.encryptedkey"] != "" || fields["encryption.data"] != "" || v.credentialGUID != ""
 	}
 	if name := fields["displayname"]; name != "" {
 		v.Name = name
@@ -169,9 +270,6 @@ func readVM(path string, eligible map[string]netip.Prefix) (VM, error) {
 		}
 		v.bindings = append(v.bindings, nicBinding{v.CurrentNetwork, strings.ToLower(v.MAC)})
 	}
-	if err := scan.Err(); err != nil {
-		return v, err
-	}
 	v.Network = v.CurrentNetwork
 	if !eligible[v.Network].IsValid() {
 		v.Network = "vmnet1"
@@ -179,6 +277,8 @@ func readVM(path string, eligible map[string]netip.Prefix) (VM, error) {
 	}
 	v.subnet = eligible[v.Network]
 	switch {
+	case count == 0 && v.Encrypted:
+		v.Reason = "加密虚拟机的配置中未找到可核实的网络适配器，无法确认隔离条件"
 	case count != 1:
 		v.Reason = adapterCountError(count).Error()
 

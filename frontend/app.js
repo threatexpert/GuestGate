@@ -45,6 +45,7 @@ function paintForm(fill = false) {
   el("config").classList.toggle("active-config", !!state?.Running);
   setText(el("selected-name"), vm.Name);
   setText(el("selected-path"), vm.Path);
+  el("encrypted-note").hidden = !vm.Encrypted;
   const isolated = !row.prefs.AllowHostAccess;
   const switching = vm.NeedsSwitch;
   const needsREST = isolated ? vm.RESTConfigured && !vm.IsOwnNetwork : vm.NeedsRESTPassword;

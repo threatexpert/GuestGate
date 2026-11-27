@@ -17,7 +17,7 @@ import (
 // Exercise the service greeting and both paths through a local SOCKS server.
 // No external resolver is contacted.
 func TestSessionHealth(t *testing.T) {
-	for _, mode := range []string{"both", "no-udp", "udp-eof", "bad-greeting", "closed"} {
+	for _, mode := range []string{"both", "no-udp", "udp-eof", "udp-timeout", "bad-greeting", "closed"} {
 		t.Run(mode, func(t *testing.T) {
 			l := dnsListener(t)
 			u := testUDPRelay(t)
@@ -45,7 +45,7 @@ func TestSessionHealth(t *testing.T) {
 				defer c.Close()
 				readDNSBytes(t, c, 3)
 				writeDNSBytes(t, c, []byte{4, 0})
-			case "both", "no-udp", "udp-eof":
+			case "both", "no-udp", "udp-eof", "udp-timeout":
 				acceptDNSControl(t, l, 0).Close()
 				for i := 0; i < 2; i++ {
 					c := acceptDNSControl(t, l, 0)
@@ -71,6 +71,9 @@ func TestSessionHealth(t *testing.T) {
 						}
 						dnsReplyCode(t, c, 0, u.LocalAddr().(*net.UDPAddr).Port)
 						response, peer := readRelayDNS(t, u, "192.0.2.53:53")
+						if mode == "udp-timeout" {
+							continue
+						}
 						if _, err := u.WriteToUDP(response, peer); err != nil {
 							t.Fatal(err)
 						}
@@ -81,6 +84,20 @@ func TestSessionHealth(t *testing.T) {
 			}
 			h := <-result
 			switch mode {
+			case "udp-timeout":
+				if h.Service.State != "ok" || h.TCP.State != "ok" || h.UDP.State != "error" {
+					t.Fatal(h)
+				}
+				query := []byte{1, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1}
+				dest := netip.AddrPortFrom(target, 53)
+				queryCtx, stop := context.WithTimeout(ctx, 2*time.Second)
+				defer stop()
+				done := make(chan error, 1)
+				go func() { _, err := r.Exchange(queryCtx, dest, query); done <- err }()
+				answerTCPDNS(t, acceptDNSControl(t, l, 0), dest, query)
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
 			case "both":
 				if h.Service.State != "ok" || h.TCP.State != "ok" || h.UDP.State != "ok" {
 					t.Fatal(h)

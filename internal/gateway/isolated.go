@@ -154,7 +154,7 @@ func (m *manager) watchNetwork(ctx context.Context, v VM, failed chan<- error) {
 			err = m.isolatedNetwork(&v, all, true)
 		}
 		if err != nil && ctx.Err() == nil {
-			_, disconnectErr := command(v.vmrun, "disconnectNamedDevice", v.Path, v.device)
+			_, disconnectErr := v.vmCommand("disconnectNamedDevice", v.Path, v.device)
 			failed <- fmt.Errorf("隔离网络复查失败: %w", errors.Join(err, disconnectErr))
 			return
 		}
@@ -163,7 +163,12 @@ func (m *manager) watchNetwork(ctx context.Context, v VM, failed chan<- error) {
 
 func runtimeNIC(v VM) (string, string, error) {
 	get := func(k string) (string, error) {
-		return command(v.vmrun, "readVariable", v.Path, "runtimeConfig", v.device+"."+k)
+		field := v.device + "." + k
+		value, err := v.vmCommand("readVariable", v.Path, "runtimeConfig", field)
+		if err != nil {
+			return "", fmt.Errorf("读取运行时网卡配置（readVariable runtimeConfig %s）: %w", field, err)
+		}
+		return value, nil
 	}
 	kind, err := get("connectionType")
 	if err != nil {
@@ -187,8 +192,8 @@ func switchIsolated(ctx context.Context, v VM, password string) (result error) {
 	if err = ctx.Err(); err != nil {
 		return err
 	}
-	if _, err = command(v.vmrun, "disconnectNamedDevice", v.Path, v.device); err != nil {
-		return err
+	if _, err = v.vmCommand("disconnectNamedDevice", v.Path, v.device); err != nil {
+		return fmt.Errorf("断开网卡（disconnectNamedDevice %s）: %w", v.device, err)
 	}
 	ctl := filepath.Join(filepath.Dir(v.vmrun), "vnetlib64.exe")
 	if _, err = os.Stat(ctl); err != nil {

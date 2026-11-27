@@ -31,7 +31,12 @@ func dnsListener(t *testing.T) *net.TCPListener {
 
 func acceptDNSControl(t *testing.T, l *net.TCPListener, method byte) net.Conn {
 	t.Helper()
-	l.SetDeadline(time.Now().Add(3 * time.Second))
+	return acceptDNSControlBefore(t, l, method, time.Now().Add(3*time.Second))
+}
+
+func acceptDNSControlBefore(t *testing.T, l *net.TCPListener, method byte, deadline time.Time) net.Conn {
+	t.Helper()
+	l.SetDeadline(deadline)
 	c, err := l.Accept()
 	if err != nil {
 		t.Fatal(err)
@@ -78,16 +83,16 @@ func dnsReplyCode(t *testing.T, c net.Conn, rep byte, port int) {
 	writeDNSBytes(t, c, binary.BigEndian.AppendUint16([]byte{5, rep, 0, 1, 0, 0, 0, 0}, uint16(port)))
 }
 
-func dnsStack(t *testing.T, l *net.TCPListener, user, password string) *gateway {
+func dnsStack(t *testing.T, l *net.TCPListener, user, password string) (*gateway, *dnsrelay.Relay) {
 	t.Helper()
 	ip := netip.MustParseAddr("192.168.7.2")
 	g := &gateway{activity: new(activityBatch), guest: net.HardwareAddr{0, 12, 41, 0, 0, 1}, mac: gatewayMAC(ip), ip: ip, link: channel.New(64, 1500, "")}
-	_, stop, err := g.startStack(t.Context(), l.Addr().String(), user, password)
+	handler, stop, err := g.startStack(t.Context(), l.Addr().String(), user, password)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(stop)
-	return g
+	return g, handler.dns
 }
 
 func guestDNSQuery(t *testing.T, g *gateway, target string, port uint16, label byte) []byte {
@@ -119,7 +124,7 @@ func guestDatagram(t *testing.T, g *gateway, target string, port, destination ui
 
 func TestGuestUDPActivityOnProxyRefusal(t *testing.T) {
 	l := dnsListener(t)
-	g := dnsStack(t, l, "", "")
+	g, _ := dnsStack(t, l, "", "")
 	guestDatagram(t, g, "192.0.2.15", 41000, 123, []byte{1})
 	c := acceptDNSControl(t, l, 0)
 	expectDNSCommand(t, c, 3, "0.0.0.0:0")
@@ -188,10 +193,32 @@ func readRelayDNS(t *testing.T, u *net.UDPConn, target string) ([]byte, *net.UDP
 	return buf[:n], peer
 }
 
+func startUDPProbe(t *testing.T, relay *dnsrelay.Relay, target netip.AddrPort) <-chan error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 6*time.Second)
+		defer cancel()
+		done <- relay.ProbeUDP(ctx, target)
+	}()
+	return done
+}
+
+func confirmUDPProbe(t *testing.T, u *net.UDPConn, target netip.AddrPort, done <-chan error) {
+	t.Helper()
+	answer, peer := readRelayDNS(t, u, target.String())
+	if _, err := u.WriteToUDP(answer, peer); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGuestDNSRelayAndReconnect(t *testing.T) {
 	l := dnsListener(t)
 	u := testUDPRelay(t)
-	g := dnsStack(t, l, "guest", "secret")
+	g, relay := dnsStack(t, l, "guest", "secret")
 	setup := func() net.Conn {
 		t.Helper()
 		c := acceptDNSControl(t, l, 2)
@@ -203,8 +230,18 @@ func TestGuestDNSRelayAndReconnect(t *testing.T) {
 		dnsReplyCode(t, c, 0, u.LocalAddr().(*net.UDPAddr).Port)
 		return c
 	}
-	first := guestDNSQuery(t, g, "1.1.1.1", 53001, 'a')
+	target := netip.MustParseAddrPort("8.8.8.8:53")
+	initial := guestDNSQuery(t, g, "8.8.8.8", 52999, 'x')
+	answerTCPDNS(t, acceptDNSControl(t, l, 0), target, initial)
+	expectGuestDNS(t, g, "8.8.8.8", 52999, initial)
+	probe := startUDPProbe(t, relay, target)
 	control := setup()
+	// The SOCKS association is open, but the DNS probe has not answered.
+	q := guestDNSQuery(t, g, "1.1.1.1", 53000, 'z')
+	answerTCPDNS(t, acceptDNSControl(t, l, 0), netip.MustParseAddrPort("1.1.1.1:53"), q)
+	expectGuestDNS(t, g, "1.1.1.1", 53000, q)
+	confirmUDPProbe(t, u, target, probe)
+	first := guestDNSQuery(t, g, "1.1.1.1", 53001, 'a')
 	answer1, peer := readRelayDNS(t, u, "1.1.1.1:53")
 	second := guestDNSQuery(t, g, "1.1.1.1", 53002, 'b')
 	answer2, peer2 := readRelayDNS(t, u, "1.1.1.1:53")
@@ -227,6 +264,10 @@ func TestGuestDNSRelayAndReconnect(t *testing.T) {
 	expectGuestDNS(t, g, "1.1.1.1", 53001, first)
 	control.Close()
 	setup() // The upstream sees a fresh association before the next guest query.
+	q = guestDNSQuery(t, g, "8.8.8.8", 53004, 'd')
+	answerTCPDNS(t, acceptDNSControl(t, l, 0), target, q)
+	expectGuestDNS(t, g, "8.8.8.8", 53004, q)
+	confirmUDPProbe(t, u, target, startUDPProbe(t, relay, target))
 	third := guestDNSQuery(t, g, "8.8.8.8", 53003, 'c')
 	answer3, peer3 := readRelayDNS(t, u, "8.8.8.8:53")
 	if _, err := u.WriteToUDP(answer3, peer3); err != nil {
@@ -242,18 +283,22 @@ func TestGuestDNSTCPOnlyOnUnsupported(t *testing.T) {
 
 func testGuestDNSFallback(t *testing.T, closeWithoutReply bool) {
 	l := dnsListener(t)
-	g := dnsStack(t, l, "", "")
+	g, relay := dnsStack(t, l, "", "")
 	for i, target := range []string{"1.1.1.1", "8.8.8.8"} {
 		port := uint16(53101 + i)
-		q := guestDNSQuery(t, g, target, port, 'a'+byte(i))
 		if i == 0 {
+			probe := startUDPProbe(t, relay, netip.MustParseAddrPort("8.8.8.8:53"))
 			c := acceptDNSControl(t, l, 0)
 			expectDNSCommand(t, c, 3, "0.0.0.0:0")
 			if !closeWithoutReply {
 				dnsReplyCode(t, c, 7, 0)
 			}
 			c.Close()
+			if err := <-probe; err == nil {
+				t.Fatal("unexpected UDP probe success")
+			}
 		}
+		q := guestDNSQuery(t, g, target, port, 'a'+byte(i))
 		c := acceptDNSControl(t, l, 0)
 		expectDNSCommand(t, c, 1, target+":53")
 		dnsReplyCode(t, c, 0, 0)
@@ -284,8 +329,8 @@ func TestDNSAssociateFailuresRetryUDP(t *testing.T) {
 	for _, failure := range []string{"authentication", "authentication EOF", "partial header", "malformed 07", "truncated 07", "general failure", "connection refused", "address unsupported"} {
 		t.Run(failure, func(t *testing.T) {
 			l := dnsListener(t)
-			g := dnsStack(t, l, "guest", "secret")
-			guestDNSQuery(t, g, "1.1.1.1", 53201, 'a')
+			_, relay := dnsStack(t, l, "guest", "secret")
+			probe := startUDPProbe(t, relay, netip.MustParseAddrPort("1.1.1.1:53"))
 			if failure == "authentication" || failure == "authentication EOF" {
 				c := acceptDNSControl(t, l, 2)
 				readDNSBytes(t, c, 14)
@@ -312,13 +357,16 @@ func TestDNSAssociateFailuresRetryUDP(t *testing.T) {
 				}
 				c.Close()
 			}
+			if err := <-probe; err == nil {
+				t.Fatal("expected UDP probe failure")
+			}
 			c := acceptDNSControl(t, l, 0)
 			expectDNSCommand(t, c, 3, "0.0.0.0:0")
 		})
 	}
 }
 
-func TestDNSUDPTimeoutRetainsAssociation(t *testing.T) {
+func TestDNSUDPTimeoutRetriesOverTCP(t *testing.T) {
 	t.Parallel()
 	l := dnsListener(t)
 	u := testUDPRelay(t)
@@ -334,31 +382,46 @@ func TestDNSUDPTimeoutRetainsAssociation(t *testing.T) {
 	result := make(chan error, 1)
 	requestCtx, expire := context.WithTimeout(ctx, 20*time.Second)
 	defer expire()
-	started := time.Now()
-	go func() { _, e := r.Exchange(requestCtx, target, q); result <- e }()
+	probe := startUDPProbe(t, r, target)
 	c := acceptDNSControl(t, l, 0)
 	expectDNSCommand(t, c, 3, "0.0.0.0:0")
 	dnsReplyCode(t, c, 0, u.LocalAddr().(*net.UDPAddr).Port)
+	confirmUDPProbe(t, u, target, probe)
+	started := time.Now()
+	go func() { _, e := r.Exchange(requestCtx, target, q); result <- e }()
 	readRelayDNS(t, u, target.String())
-	if err = <-result; err != context.DeadlineExceeded {
-		t.Fatalf("UDP loss: %v", err)
-	}
+	c = acceptDNSControlBefore(t, l, 0, started.Add(18*time.Second))
 	if elapsed := time.Since(started); elapsed < 12*time.Second || requestCtx.Err() != nil {
 		t.Fatalf("UDP query did not use its twelve-second deadline: %v", elapsed)
+	}
+	answerTCPDNS(t, c, target, q)
+	if err = <-result; err != nil {
+		t.Fatalf("TCP fallback: %v", err)
 	}
 	next, stop := context.WithTimeout(ctx, 2*time.Second)
 	defer stop()
 	go func() { _, e := r.Exchange(next, target, q); result <- e }()
-	response, peer := readRelayDNS(t, u, target.String())
-	if _, err = u.WriteToUDP(response, peer); err != nil {
-		t.Fatal(err)
-	}
+	answerTCPDNS(t, acceptDNSControl(t, l, 0), target, q)
 	if err = <-result; err != nil {
 		t.Fatal(err)
 	}
-	l.SetDeadline(time.Now().Add(50 * time.Millisecond))
-	if extra, err := l.Accept(); err == nil {
-		extra.Close()
-		t.Fatal("UDP loss opened an additional SOCKS connection")
+	other := netip.MustParseAddrPort("8.8.8.8:53")
+	go func() { _, e := r.Exchange(next, other, q); result <- e }()
+	answerTCPDNS(t, acceptDNSControl(t, l, 0), other, q)
+	if err := <-result; err != nil {
+		t.Fatalf("TCP after UDP loss for second resolver: %v", err)
 	}
+}
+
+func answerTCPDNS(t *testing.T, c net.Conn, target netip.AddrPort, query []byte) {
+	t.Helper()
+	expectDNSCommand(t, c, 1, target.String())
+	dnsReplyCode(t, c, 0, 0)
+	size := readDNSBytes(t, c, 2)
+	payload := readDNSBytes(t, c, int(binary.BigEndian.Uint16(size)))
+	if !bytes.Equal(payload, query) {
+		t.Fatalf("unexpected fallback payload %x", payload)
+	}
+	payload[2] |= 0x80
+	writeDNSBytes(t, c, append(size, payload...))
 }
