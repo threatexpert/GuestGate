@@ -80,10 +80,23 @@ foreach ($scope in [regex]::Matches($config,'(?im)^\s*subnet\s+([.0-9]+)\s+netma
     $ranges += ,@([long]$start,([long]$start + 4294967295L - (IpNumber $scope.Groups[2].Value)))
 }
 function AvailableSubnet([string]$ip) {
-    if ($ip -notmatch '^172\.(2[6789]|30)\.\d{1,3}\.0$') { return $false }
+    if ($ip -notmatch '^(?:172\.(?:2[6-9]|30)|192\.168)\.\d{1,3}\.0$') { return $false }
     $first = IpNumber $ip
     foreach ($r in $ranges) {if ($first -le $r[1] -and ($first + 255) -ge $r[0]) {return $false}}
     return $true
+}
+function FindIsolatedSubnet {
+    foreach ($b in 26..30) {
+        foreach ($c in 1..254) {
+            $ip = "172.$b.$c.0"
+            if (AvailableSubnet $ip) { return $ip }
+        }
+    }
+    foreach ($c in 0..255) {
+        $ip = "192.168.$c.0"
+        if (AvailableSubnet $ip) { return $ip }
+    }
+    throw 'No free isolated /24 subnet in the GuestGate 172.26-172.30 pool or 192.168.0.0/16'
 }
 if (!$owned.Count) {
     if (!(Test-Path $key)) { New-Item $key | Out-Null }
@@ -99,10 +112,7 @@ if (Test-Path "$key\Adapter") {
 $subnet = $k.GetValue('IPSubnetAddress')
 if (!$subnet) {
     if($audit){throw "Missing isolated subnet"}
-    $subnet = $(foreach ($b in 26..30) { foreach ($c in 1..254) {
-        $ip = "172.$b.$c.0"; if (AvailableSubnet $ip) { $ip; break }
-    }}) | Select-Object -First 1
-    if (!$subnet) { throw 'No free isolated subnet' }
+    $subnet = FindIsolatedSubnet
     New-ItemProperty $key -Name IPSubnetAddress -Value $subnet -PropertyType String | Out-Null
 }
 if (!(AvailableSubnet $subnet)) { throw "Isolated subnet overlaps an existing network or route: $subnet" }

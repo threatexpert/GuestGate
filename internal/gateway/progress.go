@@ -51,7 +51,7 @@ const (
 
 func InitialState() VMState {
 	s := VMState{Running: true, Phase: "starting", Status: "正在检查虚拟机"}
-	for i, title := range []string{"检查虚拟机与网络", "准备虚拟机网络", "启动代理网关", "配置 DHCP 网关和 DNS", "等待虚拟机接入"} {
+	for i, title := range []string{"检查虚拟机与网络", "准备虚拟机网络", "启动本地转发网关", "配置 DHCP 网关和 DNS", "等待虚拟机接入"} {
 		s.Steps[i] = SetupStep{Title: title, State: "pending"}
 	}
 	s.Steps[checkVM].State = "active"

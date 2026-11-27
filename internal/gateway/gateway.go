@@ -361,7 +361,8 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 		return e
 	}
 	defer func() { p.cleaning("正在停止转发并释放虚拟网络端口"); m.networks.detach(v.Network, &g) }()
-	p.step(openGateway, "done", hub.backend+" · "+g.ip.String())
+	p.activity.add("GuestGate", "本地转发网关使用的驱动："+hub.backend)
+	p.step(openGateway, "done", "本地网关已就绪，虚拟机将使用 "+g.ip.String()+" 作为默认网关")
 	p.step(setDHCP, "active", "正在更新该网卡的 DHCP 配置")
 	since := time.Now()
 	v.gatewayIP = g.ip
