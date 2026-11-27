@@ -21,9 +21,13 @@ h1{font-size:21px;letter-spacing:-.5px}.brand,.brand-copy{min-width:0}.subtitle{
 .appbar .brand{align-items:flex-start}.appbar .brandmark{margin-top:3px}
 .brand-title{display:flex;align-items:baseline;gap:8px}
 .brand-version{font-size:12px;font-weight:400;color:#adc1c7}
-#open-guide{margin-inline-start:.35em;color:#a9e4d5;font-size:12px;text-underline-offset:2px;white-space:nowrap}
-#open-guide:hover{color:white}
-#open-guide:focus-visible{outline:2px solid #a9e4d5;outline-offset:2px}
+#open-guide{margin-inline-start:.35em}
+.header-link{color:#a9e4d5;font-size:12px;text-underline-offset:2px;white-space:nowrap}
+.header-link:hover{color:white}
+.header-link:focus-visible{outline:2px solid #a9e4d5;outline-offset:2px}
+#about-version{color:#536b74;font-size:12px;font-weight:400}
+#about-dialog p{margin:12px 0}
+#about-project{color:#17695c;text-underline-offset:2px}
 .guide-body{margin:12px 0;padding-inline-start:1.5em;line-height:1.65}
 .guide-body li+li{margin-top:8px}
 .guide-result{padding:8px 12px;background:#edf6f2;color:#205d50;border-radius:5px}

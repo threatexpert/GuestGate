@@ -2,9 +2,16 @@
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GuestGate</title><link rel="icon" href="guestgate.ico"><link rel="stylesheet" href="style.css"></head>
 <body><header class="appbar"><div class="brand"><span class="brandmark" aria-hidden="true"></span><div class="brand-copy">
-<div class="brand-title"><h1>GuestGate</h1><small class="brand-version">v1.0.0</small></div>
-<p class="subtitle">VMware 虚拟机透明代理网关 · 客户机流量仅经 SOCKS5 出口，杜绝直连泄露 <a id="open-guide" href="#guide-dialog" aria-haspopup="dialog" aria-controls="guide-dialog">工作原理</a></p>
+<div class="brand-title"><h1>GuestGate</h1><small id="app-version" class="brand-version">v1.0.0</small><a class="header-link" id="open-about" href="#about-dialog" aria-haspopup="dialog" aria-controls="about-dialog">关于</a></div>
+<p class="subtitle">VMware 虚拟机透明代理网关 · 客户机流量仅经 SOCKS5 出口，杜绝直连泄露 <a class="header-link" id="open-guide" href="#guide-dialog" aria-haspopup="dialog" aria-controls="guide-dialog">工作原理</a></p>
 </div></div></header>
+<dialog id="about-dialog" class="app-dialog" aria-labelledby="about-title">
+<div class="brand"><span class="brandmark" aria-hidden="true"></span><h2 id="about-title">关于 GuestGate <small id="about-version"></small></h2></div>
+<p>GuestGate 是一款开源的 VMware 虚拟机透明代理网关。你可以在 Windows 宿主机上为每台虚拟机指定 SOCKS5 代理，无需在客户机里逐个配置应用。</p>
+<a id="about-project" href="https://github.com/threatexpert/GuestGate">在 GitHub 查看源码或反馈问题 ↗</a>
+<p class="quiet">MIT 许可证 · © 2026 threatexpert.cn</p>
+<form method="dialog" class="guide-actions"><button class="primary" autofocus>关闭</button></form>
+</dialog>
 <dialog id="guide-dialog" class="app-dialog" aria-labelledby="guide-title">
 <h2 id="guide-title">架构级防漏原理（零直出保障）</h2>
 <ol class="guide-body">

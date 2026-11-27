@@ -337,9 +337,16 @@ async function poll() {
   finally {setTimeout(poll,650);}
 }
 el("refresh").onclick=refresh;
-el("open-guide").onclick=event=>{
+el("about-version").textContent=el("app-version").textContent;
+for (const link of document.querySelectorAll(".header-link")) {
+  link.onclick=event=>{
+    event.preventDefault();
+    el(link.getAttribute("aria-controls")).showModal();
+  };
+}
+el("about-project").onclick=event=>{
   event.preventDefault();
-  el("guide-dialog").showModal();
+  window.runtime.BrowserOpenURL(event.currentTarget.href);
 };
 function filterSessions(value) {
   activeOnly=value;
