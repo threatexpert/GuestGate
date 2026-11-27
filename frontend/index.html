@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GuestGate</title><link rel="icon" href="guestgate.ico"><link rel="stylesheet" href="style.css"></head>
+<body><header class="appbar"><div class="brand"><span class="brandmark" aria-hidden="true"></span><h1>GuestGate</h1><span class="subtitle">VMware 透明代理</span></div><button id="refresh" disabled>加载中…</button></header>
+<main>
+<section aria-labelledby="machine-title"><h2 id="machine-title">运行中的虚拟机 <span id="count"></span></h2>
+<p id="message" role="status" data-state="loading">正在查找运行中的虚拟机…</p><div class="machines" id="machines" aria-busy="true"></div></section>
+<section id="config" hidden class="panel" aria-labelledby="selected-name">
+<div class="config-head"><div><span class="context">虚拟机配置</span><h2 id="selected-name"></h2></div><span id="save-state" role="status"></span></div>
+<p class="path" id="selected-path"></p>
+<div class="network" id="network"></div>
+<form id="settings"><div class="fields">
+<label>上游 SOCKS5<input name="proxy" autocomplete="off" spellcheck="false" placeholder="host:port 或 socks5://用户:密码@host:port"></label>
+<label>DNS 服务器<input name="dns" autocomplete="off" spellcheck="false" placeholder="8.8.8.8"></label>
+<label id="rest-label" hidden>VMware REST 密码<input name="rest" type="password" autocomplete="off"></label>
+</div><div class="actions"><span id="problem" role="status"></span><button type="submit" id="start" class="primary">启用透明代理</button></div></form>
+</section>
+<section aria-labelledby="session-title"><h2 id="session-title">代理会话</h2><p id="session-message" role="status" hidden></p><p id="empty" class="quiet">启用后可在这里查看每一步进度或停止代理。</p><div id="sessions"></div></section>
+</main>
+<template id="vm-tile"><button type="button" class="tile" aria-pressed="false"><span class="monitor" aria-hidden="true"></span><span class="tile-info"><strong></strong><small></small><span class="tile-path"></span></span></button></template>
+<template id="session"><article class="session panel"><div class="session-head"><div><h3></h3><p class="path"></p></div><span class="phase"></span><button class="stop" type="button">停止代理</button></div><p class="summary"></p><ol></ol><p class="session-error" role="status"></p></article></template>
+<script src="app.js"></script></body></html>
