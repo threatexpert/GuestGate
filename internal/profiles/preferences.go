@@ -16,6 +16,8 @@ import (
 
 type Preferences struct {
 	Proxy, DNS, RESTPassword string
+	AllowHostAccess          bool
+	SkipExitConfirmation     bool
 }
 
 // Key by the full VMX path. Display names and VMX basenames can both repeat.

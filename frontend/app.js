@@ -5,41 +5,82 @@ const form = el("settings");
 const fields = form.elements;
 const machines = new Map();
 const cards = new Map();
-const phaseNames = {starting:"正在启用", ready:"已启用", stopping:"正在停止", stopped:"已停止", error:"失败"};
-const stepNames = {pending:"待执行", active:"进行中", done:"已完成", skipped:"已跳过", cancelled:"已取消", failed:"失败"};
+const phaseNames = {starting:"正在启用", ready:"代理运行中", stopping:"正在停止", stopped:"已停止", error:"失败"};
+const stepIcons = {
+  pending:   {label:"待执行", path:"M10 3a7 7 0 1 0 0 14a7 7 0 1 0 0-14z M10 6v4l3 2"},
+  active:    {label:"进行中", path:"M10 3a7 7 0 1 1-7 7"},
+  done:      {label:"已完成", path:"m4.5 10 3.5 3.5 7.5-8"},
+  skipped:   {label:"已跳过", path:"m5 5 6 5-6 5z M14.5 5v10"},
+  cancelled: {label:"已取消", path:"M10 3a7 7 0 1 0 0 14a7 7 0 1 0 0-14z M5 15 15 5"},
+  failed:    {label:"失败", path:"m6 6 8 8 M14 6l-8 8"},
+  unrun:     {label:"未执行", path:"M10 4a6 6 0 1 0 0 12a6 6 0 1 0 0-12z"}
+};
 let selected = "", states = {}, refreshBusy = false, stateRequest = 0;
 let hasMachineList = false;
+let activeOnly = false, formMode = "";
+
+function setText(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
+
+function hasSelectedText(node) {
+  const selection = window.getSelection();
+  return selection && !selection.isCollapsed && selection.containsNode(node, true);
+}
+
+function setLiveText(node, text) {
+  if (node.textContent !== text && !hasSelectedText(node)) node.textContent = text;
+}
 
 function paintForm(fill = false) {
   const row = machines.get(selected);
   el("config").hidden = !row;
   if (!row) return;
   const vm = row.vm, state = states[row.key];
-  el("selected-name").textContent = vm.Name;
-  el("selected-path").textContent = vm.Path;
+  const mode = row.key + (state?.Running ? "/active" : "/idle");
+  if (mode !== formMode) {
+    el("config").open = !state?.Running;
+    formMode = mode;
+  }
+  el("config").classList.toggle("active-config", !!state?.Running);
+  setText(el("selected-name"), vm.Name);
+  setText(el("selected-path"), vm.Path);
+  const isolated = !row.prefs.AllowHostAccess;
   const switching = vm.NeedsSwitch;
-  el("network").textContent = switching
-    ? "启用时将网卡从 " + vm.CurrentNetwork + " 切换到仅主机模式（VMnet1）。停止代理后仍保留仅主机模式。"
-    : "仅主机网络 · " + vm.Network + "　 网卡 " + vm.MAC;
+  const needsREST = isolated ? vm.RESTConfigured && !vm.IsOwnNetwork : vm.NeedsRESTPassword;
+  const problem = vm.Reason || (!isolated && vm.SharedReason);
+  const isolatedNetwork = state?.Running && state.IsolatedNetwork || (vm.IsOwnNetwork && vm.CurrentNetwork);
+  setText(el("network"), isolated ? (isolatedNetwork ? "专用隔离网络 · "+isolatedNetwork : "启用时将网卡从 "+vm.CurrentNetwork+" 切换到专用隔离网络，上网必须通过代理。") : switching
+    ? "启用时将网卡从 " + vm.CurrentNetwork + " 切换到共享仅主机网络（VMnet1）。"
+    : "共享仅主机网络 · " + vm.Network + "　 网卡 " + vm.MAC);
   if (fill) {
     fields.proxy.value = row.prefs.Proxy;
     fields.dns.value = row.prefs.DNS;
     fields.rest.value = row.prefs.RESTPassword;
+    fields.blockHost.checked=isolated;
+    fields.confirmExit.checked=!row.prefs.SkipExitConfirmation;
   }
   const locked = !row.loaded || row.busy || state?.Running || !row.present;
-  for (const input of [fields.proxy, fields.dns, fields.rest]) input.disabled = !!locked;
-  el("rest-label").hidden = !vm.NeedsRESTPassword;
-  el("save-state").textContent = row.saveStatus;
-  el("problem").textContent = row.error || vm.Reason || "";
+  for (const input of [fields.proxy, fields.dns, fields.rest, fields.blockHost, fields.confirmExit]) input.disabled = !!locked;
+  el("switch-note").hidden = !!state?.Running;
+  setText(el("switch-note"), isolated
+    ? "停止代理后，虚拟机无法直接上外网，也无法访问宿主机端口。"
+    : "停止代理后，虚拟机无法直接上外网，仍可访问宿主机对它开放的端口。");
+  el("rest-label").hidden = !needsREST;
+  setText(el("save-state"), row.saveStatus);
+  setText(el("problem"), row.error || problem || "");
   const start = el("start");
-  start.disabled = !!(locked || vm.Reason || !row.prefs.Proxy.trim() || !row.prefs.DNS.trim() || (vm.NeedsRESTPassword && !row.prefs.RESTPassword));
-  start.textContent = state?.Running ? phaseNames[state.Phase] : switching ? "切换到仅主机并启用代理" : "启用透明代理";
+  start.hidden = !!state?.Running;
+  start.disabled = !!(locked || problem || !row.prefs.Proxy.trim() || (needsREST && !row.prefs.RESTPassword));
+  const startLabel = state?.Running ? phaseNames[state.Phase] : isolated ? "启用隔离网络并代理" : switching ? "切换到仅主机网络并启用代理" : "启用代理";
+  setText(start, row.busy && !state?.Running && !row.prefs.SkipExitConfirmation ? "正在确认出口 IP…" : startLabel);
 }
 
 function choose(key) {
   selected = key;
   for (const [k,r] of machines) r.tile.setAttribute("aria-pressed",String(k===key));
   paintForm(true);
+  drawSessions();
 }
 
 function save(row) {
@@ -81,7 +122,7 @@ async function load(row) {
 function add(vm,key) {
   const tile=el("vm-tile").content.firstElementChild.cloneNode(true);
   const row={vm,key,tile,present:true,loaded:false,busy:false,error:"",saveStatus:"",
-    prefs:{Proxy:"",DNS:"8.8.8.8",RESTPassword:""},saves:Promise.resolve(),revision:0};
+    prefs:{Proxy:"",DNS:"",RESTPassword:"",AllowHostAccess:false},saves:Promise.resolve(),revision:0};
   machines.set(key,row);
   tile.onclick=()=>choose(key);
   el("machines").append(tile);
@@ -91,30 +132,37 @@ function add(vm,key) {
 
 function drawTiles() {
   const names=new Map();
-  for (const row of machines.values()) if (row.present) names.set(row.vm.Name,1+(names.get(row.vm.Name)||0));
-  let count=0;
+  for (const row of machines.values()) {
+    if (row.present || states[row.key]?.Running) names.set(row.vm.Name,1+(names.get(row.vm.Name)||0));
+  }
+  let count=0,active=0;
+  const visible=[];
   for (const row of machines.values()) {
     const {vm,tile,key}=row;
-    tile.hidden=!row.present;
-    if (!row.present) continue;
+    const running=!!states[key]?.Running;
+    if (running) active++;
+    tile.hidden=!running && (!row.present || activeOnly);
+    if (!running && !row.present) continue;
     count++;
+    if (!tile.hidden) visible.push(key);
+    tile.classList.toggle("has-session",running);
     tile.title=vm.Path;
-    tile.querySelector("strong").textContent=vm.Name;
-    tile.querySelector("small").textContent=states[key]?.Running ? phaseNames[states[key].Phase] : vm.CurrentNetwork;
-    tile.querySelector(".tile-path").textContent=names.get(vm.Name)>1 ? vm.Path : "";
+    setText(tile.querySelector("strong"), vm.Name);
+    setText(tile.querySelector("small"), states[key]?.Running ? sessionBadge(states[key]).text : vm.CurrentNetwork);
+    setText(tile.querySelector(".tile-path"), names.get(vm.Name)>1 ? vm.Path : "");
   }
-  el("count").textContent=hasMachineList ? String(count) : "";
+  setText(el("count"), hasMachineList ? String(count) : "");
+  setText(el("active-count"), String(active));
+  el("no-active").hidden=!hasMachineList || !activeOnly || active>0;
+  if (!visible.includes(selected) && (selected || visible.length)) choose(visible[0] || "");
 }
 
 function createCard(key,state) {
   const card=el("session").content.firstElementChild.cloneNode(true);
   const list=card.querySelector("ol");
   state.Steps.forEach((_,i)=>{
-    const line=document.createElement("li");
-    for (const cls of ["step-no","step-title","step-state","step-detail"]) {
-      const cell=document.createElement("span");cell.className=cls;line.append(cell);
-    }
-    line.firstChild.textContent=String(i+1);
+    const line=el("setup-step").content.firstElementChild.cloneNode(true);
+    line.querySelector(".step-no").textContent=String(i+1);
     list.append(line);
   });
   card.querySelector(".stop").onclick=async()=>{
@@ -128,35 +176,98 @@ function createCard(key,state) {
   return card;
 }
 
+function formatBytes(bytes) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let level = 0;
+  while (bytes >= 1024 && level < units.length - 1) { bytes /= 1024; level++; }
+  return bytes.toFixed(level && bytes < 100 ? 1 : 0) + " " + units[level];
+}
+
+function sessionBadge(state) {
+  if (state.Phase === "starting") return {tone:"waiting", text:"尚未就绪"};
+  if (state.Phase !== "ready") return {tone:state.Phase, text:phaseNames[state.Phase]};
+  const health = state.Stats?.Health;
+  if (!health?.CheckedAt) return {tone:"waiting", text:"已接入 · 正在检测上游"};
+  if (health.Service.State !== "ok") return {tone:"error", text:"已接入 · 上游异常"};
+  if (health.TCP.State === "ok" && ["ok","unsupported"].includes(health.UDP.State))
+    return {tone:"ready", text:"已就绪 · 代理运行中"};
+  return {tone:"warning", text:"已接入 · 转发探测异常"};
+}
+
+function showTelemetry(card, state) {
+  const panel = card.querySelector(".telemetry"), stats = state.Stats;
+  panel.hidden = !state.Running || state.Phase !== "ready" || !stats?.Server;
+  if (panel.hidden) return;
+  for (const [name, key] of [["up","Up"], ["down","Down"]]) {
+    setLiveText(panel.querySelector("."+name+"-rate"), formatBytes(stats[key+"Rate"]) + "/s");
+    setLiveText(panel.querySelector("."+name+"-total"), "累计 " + formatBytes(stats[key+"Bytes"]));
+  }
+  setLiveText(panel.querySelector(".server-address"), stats.Server);
+  const health = stats.Health;
+  for (const row of panel.querySelectorAll("[data-check]")) {
+    const key = row.dataset.check, result = health?.[key];
+    const labels = {ok:key === "Service" ? "正常" : "可用", error:key === "Service" ? "异常" : "探测失败", unsupported:"不支持", blocked:"上游异常"};
+    row.dataset.state = result?.State || "pending";
+    setText(row.querySelector("b"), labels[row.dataset.state] || "检测中");
+    setText(row.querySelector("small"), result?.Detail || "");
+  }
+  const checked = health?.CheckedAt ? new Date(health.CheckedAt * 1000).toLocaleTimeString("zh-CN",{hour12:false}) + " 检测" : "正在检测";
+  setLiveText(panel.querySelector(".check-note"), checked + " · TCP / UDP 探测目标 " + stats.DNS + ":53");
+  setLiveText(panel.querySelector(".dial-error"), stats.LastTCPError ? "最近一次虚拟机 TCP 连接失败 · " + stats.LastTCPError : "");
+}
+
 function drawSessions() {
   for (const [key,state] of Object.entries(states)) {
     const row=machines.get(key), vm=row?.vm;
     const card=cards.get(key) || createCard(key,state);
+    card.hidden=key!==selected;
+    if (card.hidden) continue;
+    const setup = card.querySelector(".setup");
+    if (card.dataset.phase !== state.Phase) setup.open = state.Phase === "starting" || state.Phase === "error";
     card.dataset.phase=state.Phase;
-    card.querySelector("h3").textContent=vm?.Name || key.split(/[\\/]/).pop();
-    card.querySelector(".path").textContent=vm?.Path || key;
+    setText(card.querySelector("h3"), vm?.Name || key.split(/[\\/]/).pop());
+    setText(card.querySelector(".path"), vm?.Path || key);
     const done=state.Steps.filter(s=>s.State==="done" || s.State==="skipped").length;
-    card.querySelector(".phase").textContent=phaseNames[state.Phase]+" · "+done+"/"+state.Steps.length+" 步";
-    card.querySelector(".summary").textContent=state.Status;
+    const badge = sessionBadge(state);
+    card.dataset.tone = badge.tone;
+    setText(card.querySelector(".phase"), badge.text);
+    card.querySelector(".isolation-status").hidden = !(state.Running && state.Phase === "ready");
+    setText(card.querySelector(".isolation-status span"), state.IsolatedNetwork ? "专用隔离网络 · 外网仅经代理，宿主机端口已阻断" : "共享仅主机网络 · 未阻断宿主机端口访问");
+    const help = card.querySelector(".guest-help");
+    help.hidden = !(state.Phase === "starting" && state.ShowGuestHelp);
+    if (!help.hidden) {
+      const family = vm?.GuestOSFamily || "other";
+      for (const tip of help.querySelectorAll("[data-os]")) tip.hidden = tip.dataset.os !== family;
+    }
+    setText(setup.querySelector("summary"), "启动步骤 · " + done + "/" + state.Steps.length);
+    setText(card.querySelector(".summary"), state.Phase === "ready" ? "" : state.Status);
+    showTelemetry(card,state);
     const stop=card.querySelector(".stop");
     stop.hidden=!state.Running;stop.disabled=state.Phase==="stopping";
+    setText(stop, stop.disabled ? "正在停止…" : "停止代理");
     state.Steps.forEach((step,i)=>{
       const node=card.querySelector("ol").children[i];
-      node.dataset.state=step.State;
-      node.children[1].textContent=step.Title;
-      node.children[2].textContent=step.State==="pending" && !state.Running ? "未执行" : stepNames[step.State];
-      const plannedSwitch = i===1 && vm?.NeedsSwitch && step.State==="pending"
-        ? vm.CurrentNetwork+" → 仅主机模式（VMnet1）" : "";
-      node.children[3].textContent=step.Detail || plannedSwitch;
+      const status = step.State==="pending" && !state.Running ? "unrun" : step.State;
+      if (node.dataset.state !== status) {
+        node.dataset.state = status;
+        const icon = node.querySelector(".step-state");
+        const {label, path} = stepIcons[status];
+        icon.title = label;
+        icon.setAttribute("aria-label", label);
+        icon.querySelector("path").setAttribute("d", path);
+      }
+      setText(node.children[1], step.Title);
+      const plannedSwitch = i===1 && vm && (row?.prefs.AllowHostAccess ? vm.NeedsSwitch : !vm.IsOwnNetwork) && step.State==="pending"
+        ? vm.CurrentNetwork+(!row?.prefs.AllowHostAccess ? " → 专用隔离网络" : " → 共享仅主机网络（VMnet1）") : "";
+      setLiveText(node.children[3], step.Detail || plannedSwitch);
     });
   }
-  el("empty").hidden=!!cards.size;
 }
 
 form.oninput=()=>{
   const row=machines.get(selected);
   if (!row?.loaded) return;
-  row.prefs={Proxy:fields.proxy.value,DNS:fields.dns.value,RESTPassword:fields.rest.value};
+  row.prefs={Proxy:fields.proxy.value,DNS:fields.dns.value,RESTPassword:fields.rest.value,AllowHostAccess:!fields.blockHost.checked,SkipExitConfirmation:!fields.confirmExit.checked};
   row.error=""; save(row);paintForm();
 };
 form.onsubmit=async event=>{
@@ -166,7 +277,7 @@ form.onsubmit=async event=>{
   row.busy=true;row.error="";paintForm();
   try {
     await save(row);
-    await api.StartVM(row.vm.Path,row.prefs.Proxy,row.prefs.DNS,row.prefs.RESTPassword);
+    await api.StartVMWithHostAccess(row.vm.Path,row.prefs.Proxy,row.prefs.DNS,row.prefs.RESTPassword,!!row.prefs.AllowHostAccess);
     await updateStates();
     cards.get(row.key)?.scrollIntoView({block:"nearest"});
   } catch(e){row.error=String(e);}
@@ -177,7 +288,8 @@ async function refresh() {
   if (refreshBusy) return;
   const button=el("refresh"), message=el("message"), list=el("machines");
   refreshBusy=button.disabled=true;
-  button.textContent=hasMachineList ? "刷新中…" : "加载中…";
+  button.title = hasMachineList ? "正在刷新虚拟机列表" : "正在加载虚拟机列表";
+  button.setAttribute("aria-label", button.title);
   list.setAttribute("aria-busy","true");
   message.dataset.state="loading";
   message.textContent=hasMachineList ? "正在刷新虚拟机列表…" : "正在查找运行中的虚拟机…";
@@ -191,7 +303,6 @@ async function refresh() {
       if (!row.loaded && row.error) {row.error="";load(row);}
     }
     for (const row of machines.values()) row.present=found.has(row.key);
-    if (!found.has(selected)) choose(found.values().next().value || "");
     hasMachineList=true;
     drawTiles();paintForm();drawSessions();
     message.dataset.state=found.size ? "ready" : "empty";
@@ -202,7 +313,8 @@ async function refresh() {
   } finally {
     list.setAttribute("aria-busy","false");
     refreshBusy=button.disabled=false;
-    button.textContent=message.dataset.state==="error" ? "重试刷新" : "刷新虚拟机";
+    button.title = message.dataset.state === "error" ? "重新加载虚拟机列表" : "刷新虚拟机列表";
+    button.setAttribute("aria-label", button.title);
   }
 }
 
@@ -221,8 +333,44 @@ async function updateStates() {
 async function poll() {
   const message=el("session-message");
   try {await updateStates();message.hidden=true;}
-  catch(e){message.hidden=false;message.textContent="无法读取会话状态："+String(e);}
+  catch(e){message.hidden=false;setText(message, "无法读取会话状态："+String(e));}
   finally {setTimeout(poll,650);}
 }
 el("refresh").onclick=refresh;
+el("open-guide").onclick=event=>{
+  event.preventDefault();
+  el("guide-dialog").showModal();
+};
+function filterSessions(value) {
+  activeOnly=value;
+  el("all-vms").setAttribute("aria-pressed",String(!value));
+  el("active-vms").setAttribute("aria-pressed",String(value));
+  drawTiles();
+}
+el("all-vms").onclick=()=>filterSessions(false);
+el("active-vms").onclick=()=>filterSessions(true);
+
+function showCleanup(report) {
+  const dialog=el("closing");
+  if (!dialog.open) dialog.showModal();
+  const items=Object.entries(report.Sessions).map(([key,status])=>{
+    const row=machines.get(key);
+    const item=document.createElement("li"), name=document.createElement("strong");
+    const path=document.createElement("small"), detail=document.createElement("p");
+    name.textContent=row?.vm.Name || key.split(/[\\/]/).pop();
+    path.className="path";path.textContent=row?.vm.Path || key;
+    detail.textContent=status;
+    item.append(name,path,detail);
+    return item;
+  });
+  el("close-list").replaceChildren(...items);
+  const failed=report.Done && report.Failed;
+  el("close-title").textContent=failed ? "退出清理遇到问题" : "正在退出 GuestGate";
+  el("close-note").textContent=failed ? "工作进程已退出，请查看下方错误。" :
+    report.Done ? "清理已完成。" : "正在结束代理会话，完成后窗口会自动关闭。";
+  el("close-finish").hidden=!failed;
+}
+el("closing").oncancel=event=>event.preventDefault();
+el("close-finish").onclick=()=>window.runtime.Quit();
+window.runtime.EventsOn("guestgate:closing",showCleanup);
 refresh();poll();

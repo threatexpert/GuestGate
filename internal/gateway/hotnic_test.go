@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +35,42 @@ func TestNetworkSelection(t *testing.T) {
 		v, err = readVM(path, nets)
 		if err != nil || v.Reason == "" {
 			t.Fatal("multiple NICs accepted")
+		}
+	}
+}
+
+func TestGuestHelpUsesConfiguredOS(t *testing.T) {
+	for id, want := range map[string]string{
+		"windows9-64": "windows", "WinXPPro": "windows", "ubuntu-64": "linux", "debian12-64": "linux", "other6xlinux-64": "linux", "rhel9-64": "linux", "darwin23-64": "other", "freebsd-64": "other", "": "other",
+	} {
+		vmx := filepath.Join(t.TempDir(), "Windows.vmx")
+		if err := os.WriteFile(vmx, []byte(fmt.Sprintf("displayName = \"Windows\"\nguestOS = %q\n", id)), 0600); err != nil {
+			t.Fatal(err)
+		}
+		vm, err := readVM(vmx, nil)
+		if err != nil || vm.GuestOSFamily != want {
+			t.Fatalf("guestOS %q: got %q (%v), want %q", id, vm.GuestOSFamily, err, want)
+		}
+	}
+}
+
+func TestRecheckConfiguredAdapter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "check.vmx")
+	v := VM{Path: path, device: "ethernet0", MAC: "00:0c:29:00:00:01", Network: "vmnet2", subnet: netip.MustParsePrefix("192.168.7.0/24")}
+	const one = "ethernet0.present = \"TRUE\"\nethernet0.connectionType = \"custom\"\nethernet0.vnet = \"VMnet2\"\nethernet0.generatedAddress = \"00:0c:29:00:00:01\"\n"
+	for _, tc := range []struct{ config, want string }{
+		{"", "0 个网络适配器"},
+		{one, ""},
+		{one + "ethernet1.present = \"TRUE\"\nethernet1.startConnected = \"FALSE\"\n", "2 个网络适配器"},
+		{one + "ethernet1.present = \"FALSE\"\n", ""},
+		{strings.Replace(one, "VMnet2", "VMnet8", 1), "网络已变化"},
+	} {
+		if err := os.WriteFile(path, []byte(tc.config), 0600); err != nil {
+			t.Fatal(err)
+		}
+		err := v.verifyConfiguredAdapter()
+		if (tc.want == "" && err != nil) || (tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want))) {
+			t.Fatalf("want %q, got %v", tc.want, err)
 		}
 	}
 }

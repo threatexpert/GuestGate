@@ -12,6 +12,7 @@ import (
 	winoptions "github.com/wailsapp/wails/v2/pkg/options/windows"
 	"golang.org/x/sys/windows"
 
+	_ "guestgate/assets/windows" // Link the application icon and manifest.
 	"guestgate/frontend"
 	"guestgate/internal/desktop"
 	"guestgate/internal/gateway"
@@ -52,8 +53,10 @@ func main() {
 		Title: "GuestGate", Width: 640, Height: 440, StartHidden: true,
 		Windows:     &winoptions.Options{WindowClassName: class},
 		AssetServer: &assetserver.Options{Assets: frontend.Assets}, Bind: []interface{}{app},
-		OnDomReady: func(ctx context.Context) { firstShow.Do(func() { desktop.ShowStartupWindow(ctx, class) }) },
-		OnShutdown: func(context.Context) { shutdown() },
+		OnStartup:     func(ctx context.Context) { desktop.AttachWindow(ui, ctx) },
+		OnDomReady:    func(ctx context.Context) { firstShow.Do(func() { desktop.ShowStartupWindow(ctx, class) }) },
+		OnBeforeClose: func(ctx context.Context) bool { return desktop.BeforeClose(ctx, ui) },
+		OnShutdown:    func(context.Context) { shutdown() },
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

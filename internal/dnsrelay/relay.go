@@ -29,6 +29,7 @@ type Relay struct {
 	mu      sync.Mutex
 	current *dnsAssociation
 	tcpOnly bool
+	lastErr error
 	changed chan struct{}
 }
 
@@ -38,10 +39,10 @@ func New(ctx context.Context, server string, auth *proxy.Auth, tcp proxy.Context
 	return r
 }
 
-func (r *Relay) publish(a *dnsAssociation, tcpOnly bool) {
+func (r *Relay) publish(a *dnsAssociation, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.current, r.tcpOnly = a, tcpOnly
+	r.current, r.lastErr, r.tcpOnly = a, err, errors.Is(err, errUDPUnsupported)
 	close(r.changed)
 	r.changed = make(chan struct{})
 }
@@ -58,15 +59,19 @@ func (r *Relay) run() {
 	delay := minDelay
 	for r.ctx.Err() == nil {
 		a, err := openDNSAssociation(r.ctx, r.server, r.auth)
+		r.publish(a, err)
 		if errors.Is(err, errUDPUnsupported) {
-			r.publish(nil, true)
-			return
+			select {
+			case <-r.ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+				continue
+			}
 		}
 		if err == nil {
 			started := time.Now()
-			r.publish(a, false)
 			a.serve(r.ctx)
-			r.publish(nil, false)
+			r.publish(nil, net.ErrClosed)
 			if time.Since(started) >= 3*time.Second {
 				delay = minDelay
 			}
@@ -83,14 +88,21 @@ func (r *Relay) run() {
 func (r *Relay) Done() <-chan struct{} { return r.done }
 
 func (r *Relay) Exchange(ctx context.Context, target netip.AddrPort, query []byte) ([]byte, error) {
+	return r.exchange(ctx, target, query, true)
+}
+
+func (r *Relay) exchange(ctx context.Context, target netip.AddrPort, query []byte, allowTCP bool) ([]byte, error) {
 	if len(query) < 12 || len(query) > 65535 {
 		return nil, errors.New("invalid DNS message length")
 	}
 	r.first.Do(func() { close(r.demand) })
 	for {
 		r.mu.Lock()
-		a, tcpOnly, changed := r.current, r.tcpOnly, r.changed
+		a, tcpOnly, changed, err := r.current, r.tcpOnly, r.changed, r.lastErr
 		r.mu.Unlock()
+		if !allowTCP && err != nil {
+			return nil, err
+		}
 		if tcpOnly {
 			return exchangeTCPDNS(ctx, r.tcp, target.String(), query)
 		}

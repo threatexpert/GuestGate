@@ -1,22 +1,83 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GuestGate</title><link rel="icon" href="guestgate.ico"><link rel="stylesheet" href="style.css"></head>
-<body><header class="appbar"><div class="brand"><span class="brandmark" aria-hidden="true"></span><h1>GuestGate</h1><span class="subtitle">VMware 透明代理</span></div><button id="refresh" disabled>加载中…</button></header>
-<main>
-<section aria-labelledby="machine-title"><h2 id="machine-title">运行中的虚拟机 <span id="count"></span></h2>
-<p id="message" role="status" data-state="loading">正在查找运行中的虚拟机…</p><div class="machines" id="machines" aria-busy="true"></div></section>
-<section id="config" hidden class="panel" aria-labelledby="selected-name">
-<div class="config-head"><div><span class="context">虚拟机配置</span><h2 id="selected-name"></h2></div><span id="save-state" role="status"></span></div>
+<body><header class="appbar"><div class="brand"><span class="brandmark" aria-hidden="true"></span><div class="brand-copy">
+<div class="brand-title"><h1>GuestGate</h1><small class="brand-version">v1.0.0</small></div>
+<p class="subtitle">VMware 虚拟机透明代理网关 · 客户机流量仅经 SOCKS5 出口，杜绝直连泄露 <a id="open-guide" href="#guide-dialog" aria-haspopup="dialog" aria-controls="guide-dialog">工作原理</a></p>
+</div></div></header>
+<dialog id="guide-dialog" class="app-dialog" aria-labelledby="guide-title">
+<h2 id="guide-title">架构级防漏原理（零直出保障）</h2>
+<ol class="guide-body">
+  <li><strong>先切断外网：</strong> 将虚拟机网卡设为仅主机模式（Host-Only）或隔离模式，从底层剥夺其直连公网的能力。</li>
+  <li><strong>单点搭桥：</strong> GuestGate 直接监听该虚拟机网卡的底层数据包，并实现将其透明代理转发至上游代理。</li>
+</ol>
+<p class="guide-result"><strong>可靠性闭环：</strong> GuestGate 是虚拟机通往外部的唯一桥梁。无论代理服务停止、程序意外退出还是上游节点故障，桥梁断开即刻彻底断网。</p>
+<form method="dialog" class="guide-actions"><button class="primary" autofocus>关闭</button></form>
+</dialog>
+<main class="workspace">
+<aside class="sidebar" aria-labelledby="machine-title">
+<div class="sidebar-head"><h2 id="machine-title">虚拟机</h2>
+<button id="refresh" type="button" title="刷新虚拟机列表" aria-label="刷新虚拟机列表" aria-controls="machines" disabled>
+<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 7v5h-5"/><path d="M19.8 11a8 8 0 1 0-1.9 6.3"/></svg>
+</button></div>
+<div class="filters" aria-label="虚拟机筛选"><button id="all-vms" aria-pressed="true">全部 <span id="count"></span></button><button id="active-vms" aria-pressed="false">代理中 <span id="active-count">0</span></button></div>
+<p id="message" role="status" data-state="loading">正在查找运行中的虚拟机…</p><p id="no-active" class="quiet" hidden>当前没有活动代理。</p><div class="machines" id="machines" aria-busy="true"></div>
+</aside>
+<div class="detail">
+<p id="session-message" role="status" hidden></p>
+<div id="sessions" aria-label="选中虚拟机的代理会话"></div>
+<details id="config" hidden open class="panel" aria-labelledby="selected-name">
+<summary class="config-head"><div><span class="context">虚拟机配置</span><h2 id="selected-name"></h2></div><span id="save-state" role="status"></span></summary>
 <p class="path" id="selected-path"></p>
 <div class="network" id="network"></div>
 <form id="settings"><div class="fields">
 <label>上游 SOCKS5<input name="proxy" autocomplete="off" spellcheck="false" placeholder="host:port 或 socks5://用户:密码@host:port"></label>
-<label>DNS 服务器<input name="dns" autocomplete="off" spellcheck="false" placeholder="8.8.8.8"></label>
+<label>DNS 服务器<input name="dns" autocomplete="off" spellcheck="false" placeholder="可留空，默认使用 8.8.8.8"></label>
 <label id="rest-label" hidden>VMware REST 密码<input name="rest" type="password" autocomplete="off"></label>
-</div><div class="actions"><span id="problem" role="status"></span><button type="submit" id="start" class="primary">启用透明代理</button></div></form>
-</section>
-<section aria-labelledby="session-title"><h2 id="session-title">代理会话</h2><p id="session-message" role="status" hidden></p><p id="empty" class="quiet">启用后可在这里查看每一步进度或停止代理。</p><div id="sessions"></div></section>
-</main>
+</div><label class="host-policy"><input type="checkbox" name="blockHost" checked>启用严格隔离模式（不勾选则使用仅主机模式）</label>
+<label class="host-policy"><input type="checkbox" name="confirmExit" checked>启动时确认出口IP</label>
+<div class="actions"><div><p class="quiet">虚拟机内的应用无需单独配置代理。</p><p id="switch-note" hidden></p><p id="problem" role="status"></p></div><button type="submit" id="start" class="primary">启用代理</button></div></form>
+</details></div></main>
+<footer class="log-footer"><details id="activity">
+<summary>活动日志</summary>
+<div class="log-tools"><span id="log-note" role="status"></span><button type="button" id="log-copy">复制日志</button><button type="button" id="log-clear">清空</button></div>
+<div id="log-lines" tabindex="0" aria-label="最近的活动日志"></div>
+</details></footer>
+<dialog id="exit-dialog" class="app-dialog" aria-labelledby="exit-title" aria-describedby="exit-machine exit-path">
+  <h2 id="exit-title">确认出口 IP</h2>
+  <p id="exit-machine"></p><p id="exit-path" class="path"></p>
+  <div class="exit-result"><strong id="exit-ip"></strong><span id="exit-location"></span></div>
+  <dl class="exit-details"><dt>上游 SOCKS5</dt><dd id="exit-server"></dd><dt>查询来源</dt><dd id="exit-source"></dd></dl>
+  <p id="exit-error" role="alert"></p>
+  <div class="exit-actions"><button type="button" id="exit-cancel" autofocus>取消</button><button type="button" id="exit-approve" class="primary">确认并启用代理</button></div>
+</dialog>
+<dialog id="closing" aria-labelledby="close-title"><h2 id="close-title">正在退出 GuestGate</h2><p id="close-note" role="status">清理完成后会自动关闭窗口。</p><ul id="close-list"></ul><button id="close-finish" hidden>关闭窗口</button></dialog>
 <template id="vm-tile"><button type="button" class="tile" aria-pressed="false"><span class="monitor" aria-hidden="true"></span><span class="tile-info"><strong></strong><small></small><span class="tile-path"></span></span></button></template>
-<template id="session"><article class="session panel"><div class="session-head"><div><h3></h3><p class="path"></p></div><span class="phase"></span><button class="stop" type="button">停止代理</button></div><p class="summary"></p><ol></ol><p class="session-error" role="status"></p></article></template>
-<script src="app.js"></script></body></html>
+<template id="session"><article class="session panel"><div class="session-head"><div><span class="context">代理会话</span><h3></h3><p class="path"></p></div><span class="phase"></span><button class="stop" type="button">停止代理</button></div>
+<p class="isolation-status" hidden><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 6v5c0 5 3 8 8 10 5-2 8-5 8-10V6z"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg><span></span></p>
+<p class="summary"></p>
+<p class="guest-help" hidden>
+<span data-os="windows" hidden>在虚拟机内按 <kbd>Win</kbd> + <kbd>R</kbd>，输入 <code>ncpa.cpl</code> 并回车。右键当前网卡，先禁用再启用。</span>
+<span data-os="linux" hidden>在 Linux 的网络设置中，将当前有线连接断开后重新连接。如果使用 NetworkManager，也可以在虚拟机终端运行 <code>nmtui</code>，在“启用连接”中停用并重新启用该连接。</span>
+<span data-os="other" hidden>请在虚拟机内检查网卡是否设为自动获取 IP（DHCP），然后通过系统的网络设置重新连接该网卡。</span>
+GuestGate 会继续自动检测。</p>
+<section class="telemetry" aria-label="代理运行状态" hidden>
+<div class="speeds">
+<div><span>↑ 上行速度</span><strong class="up-rate"></strong><small class="up-total"></small></div>
+<div><span>↓ 下行速度</span><strong class="down-rate"></strong><small class="down-total"></small></div>
+</div>
+<div class="upstream-head"><strong>上游 SOCKS5</strong><span class="server-address"></span></div>
+<dl class="health-list">
+<div data-check="Service"><dt>服务状态</dt><dd><b></b><small></small></dd></div>
+<div data-check="TCP"><dt>TCP 代理</dt><dd><b></b><small></small></dd></div>
+<div data-check="UDP"><dt>UDP 代理</dt><dd><b></b><small></small></dd></div>
+</dl>
+<p class="check-note"></p><p class="dial-error"></p>
+</section>
+<details class="setup"><summary></summary><ol></ol></details><p class="session-error" role="status"></p></article></template>
+<template id="setup-step"><li>
+  <span class="step-no"></span><span class="step-title"></span>
+  <span class="step-state" role="img"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path/></svg></span>
+  <span class="step-detail"></span>
+</li></template>
+<script src="app.js"></script><script src="activity.js"></script><script src="exit-confirmation.js"></script></body></html>

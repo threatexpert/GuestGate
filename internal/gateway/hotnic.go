@@ -180,7 +180,10 @@ func (r vmREST) switchNIC(ctx context.Context, v VM) error {
 		if err := r.call(ctx, "GET", nicPath, nil, &list); err != nil {
 			return restNIC{}, err
 		}
-		if len(list.NICs) != 1 || !strings.EqualFold(list.NICs[0].MACAddress, v.MAC) {
+		if len(list.NICs) != 1 {
+			return restNIC{}, adapterCountError(len(list.NICs))
+		}
+		if !strings.EqualFold(list.NICs[0].MACAddress, v.MAC) {
 			return restNIC{}, fmt.Errorf("虚拟机网卡已变化，请刷新列表")
 		}
 		return list.NICs[0], nil
@@ -189,15 +192,22 @@ func (r vmREST) switchNIC(ctx context.Context, v VM) error {
 	if err != nil {
 		return err
 	}
-	if err = r.call(ctx, "PUT", nicPath+"/"+strconv.Itoa(nic.Index), map[string]string{"type": "hostonly"}, nil); err != nil {
+	kind, network := "hostonly", "vmnet1"
+	params := map[string]string{"type": kind}
+	if v.isolated {
+		kind = "custom"
+		network = v.Network
+		params = map[string]string{"type": kind, "vmnet": strings.Replace(network, "vmnet", "VMnet", 1)}
+	}
+	if err = r.call(ctx, "PUT", nicPath+"/"+strconv.Itoa(nic.Index), params, nil); err != nil {
 		return err
 	}
 	nic, err = read()
 	if err != nil {
 		return err
 	}
-	if !strings.EqualFold(nic.Type, "hostonly") || !strings.EqualFold(nic.VMnet, "vmnet1") {
-		return fmt.Errorf("VMware 未确认网卡已连接 VMnet1")
+	if !strings.EqualFold(nic.Type, kind) || !strings.EqualFold(nic.VMnet, network) {
+		return fmt.Errorf("VMware 未确认网卡已连接 %s", network)
 	}
 	return nil
 }
@@ -260,13 +270,13 @@ func switchHostOnly(parent context.Context, v VM, password string) error {
 				return err
 			}
 			for {
-				disk, err := readVM(v.Path, map[string]netip.Prefix{"vmnet1": v.subnet})
-				if err == nil && disk.Reason == "" && !disk.NeedsSwitch && disk.Network == "vmnet1" && disk.device == v.device && strings.EqualFold(disk.MAC, v.MAC) {
+				disk, err := readVM(v.Path, map[string]netip.Prefix{v.Network: v.subnet})
+				if err == nil && disk.Reason == "" && !disk.NeedsSwitch && disk.Network == v.Network && disk.device == v.device && strings.EqualFold(disk.MAC, v.MAC) {
 					return nil
 				}
 				select {
 				case <-ctx.Done():
-					return fmt.Errorf("等待 VMware 写回 VMnet1: %w", ctx.Err())
+					return fmt.Errorf("等待 VMware 写回 %s: %w", v.Network, ctx.Err())
 				case <-ticker.C:
 				}
 			}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -21,6 +22,10 @@ import (
 type nicBinding struct{ network, mac string }
 
 type VM struct {
+	GuestOSFamily                                    string
+	IsOwnNetwork, RESTConfigured                     bool
+	isolated                                         bool
+	SharedReason                                     string
 	dns, gatewayIP                                   netip.Addr
 	scope                                            gatewayAddresses
 	bindings                                         []nicBinding
@@ -85,6 +90,7 @@ func Machines() ([]VM, error) {
 	if e != nil {
 		return nil, e
 	}
+	restConfigured := needsRESTPassword()
 	out := []VM{}
 	for _, path := range strings.Split(listing, "\n") {
 		path = strings.TrimSpace(path)
@@ -96,6 +102,8 @@ func Machines() ([]VM, error) {
 			return nil, err
 		}
 		v.vmrun = vmrun
+		v.RESTConfigured = restConfigured
+		v.IsOwnNetwork = isOwnVMnet(v)
 		out = append(out, v)
 	}
 	owners := make(map[nicBinding]int)
@@ -111,7 +119,7 @@ func Machines() ([]VM, error) {
 			other--
 		}
 		if v.Reason == "" && other > 0 {
-			out[i].Reason = "目标 Host-only 网络上已有相同 MAC 的虚拟网卡"
+			out[i].SharedReason = "目标共享仅主机网络上已有相同 MAC 的虚拟网卡"
 		}
 	}
 	return out, nil
@@ -134,6 +142,7 @@ func readVM(path string, eligible map[string]netip.Prefix) (VM, error) {
 	if name := fields["displayname"]; name != "" {
 		v.Name = name
 	}
+	v.GuestOSFamily = guestOSFamily(fields["guestos"])
 	count := 0
 	for k, val := range fields {
 		if !nicPresent.MatchString(k) || !strings.EqualFold(val, "true") {
@@ -171,13 +180,15 @@ func readVM(path string, eligible map[string]netip.Prefix) (VM, error) {
 	v.subnet = eligible[v.Network]
 	switch {
 	case count != 1:
-		v.Reason = fmt.Sprintf("检测到 %d 张虚拟网卡，需要一张网卡以保证唯一出口", count)
-	case !v.subnet.IsValid():
-		v.Reason = "默认 VMnet1 不可用，需要启用 DHCP 且有可用主机地址的 IPv4 Host-only 网络"
+		v.Reason = adapterCountError(count).Error()
+
 	default:
 		if m, err := net.ParseMAC(v.MAC); err != nil || len(m) != 6 {
 			v.Reason = "无法读取虚拟网卡 MAC"
 		}
+	}
+	if !v.subnet.IsValid() {
+		v.SharedReason = "默认 VMnet1 不可用，需要启用 DHCP 的 IPv4 仅主机网络（Host-only）"
 	}
 	if v.NeedsSwitch {
 		v.NeedsRESTPassword = needsRESTPassword()
@@ -186,6 +197,44 @@ func readVM(path string, eligible map[string]netip.Prefix) (VM, error) {
 }
 
 var nicPresent = regexp.MustCompile(`^ethernet[0-9]+\.present$`)
+
+func adapterCountError(count int) error {
+	return fmt.Errorf("检测到 %d 个网络适配器。请在 VMware 设置中将网络适配器数量调整为 1，再刷新列表", count)
+}
+
+func (v VM) checkAdapter(current VM) error {
+	if current.Reason != "" {
+		return errors.New(current.Reason)
+	}
+	if current.device != v.device || !strings.EqualFold(current.MAC, v.MAC) || !strings.EqualFold(current.CurrentNetwork, v.Network) {
+		return fmt.Errorf("网络适配器或连接的网络已变化，请刷新列表")
+	}
+	return nil
+}
+
+func (v VM) verifyConfiguredAdapter() error {
+	current, err := readVM(v.Path, map[string]netip.Prefix{v.Network: v.subnet})
+	if err != nil {
+		return err
+	}
+	return v.checkAdapter(current)
+}
+
+func guestOSFamily(configured string) string {
+	id := strings.ToLower(strings.TrimSpace(configured))
+	if strings.HasPrefix(id, "win") || strings.HasPrefix(id, "longhorn") {
+		return "windows"
+	}
+	if strings.Contains(id, "linux") {
+		return "linux"
+	}
+	for _, prefix := range []string{"ubuntu", "debian", "fedora", "redhat", "rhel", "centos", "suse", "opensuse", "sles", "asianux", "photon", "mandrake", "mandriva", "coreos", "flatcar", "alpine", "vmware-photon"} {
+		if strings.HasPrefix(id, prefix) {
+			return "linux"
+		}
+	}
+	return "other"
+}
 
 func captureDevice(v VM) (string, error) {
 	// Resolve the VMware adapter by its driver description, including renamed interfaces.

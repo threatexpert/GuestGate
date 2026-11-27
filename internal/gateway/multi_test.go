@@ -46,7 +46,7 @@ func TestSharedDHCPAndRenewHint(t *testing.T) {
 	if err != nil || !bytes.Equal(base, clean) {
 		t.Fatal("DHCP restore", err)
 	}
-	if leaseHintDue(44*time.Second, netip.Addr{}, 0) || !leaseHintDue(45*time.Second, netip.Addr{}, 0) || leaseHintDue(time.Minute, a.dns, 0) || leaseHintDue(time.Minute, netip.Addr{}, 1) {
+	if leaseHintDue(10*time.Second-time.Nanosecond, netip.Addr{}, 0) || !leaseHintDue(10*time.Second, netip.Addr{}, 0) || leaseHintDue(time.Minute, a.dns, 0) || leaseHintDue(time.Minute, netip.Addr{}, 1) {
 		t.Fatal("incorrect DHCP timeout hint")
 	}
 }
@@ -123,7 +123,7 @@ func TestTwoGuestsWaitForOwnSOCKSReply(t *testing.T) {
 	drivers := []frameBackend{{"test", func() (vmnet.Port, error) { opened++; return wire, nil }}}
 	attach := func(mac byte, server string) (*gateway, func()) {
 		ctx, cancel := context.WithCancel(context.Background())
-		g := &gateway{addresses: gatewayAddresses{subnet: netip.MustParsePrefix("192.168.7.0/24")}, guest: net.HardwareAddr{0, 12, 41, 0, 0, mac}, mac: gatewayMAC(ip), ip: ip, link: channel.New(64, 1500, "")}
+		g := &gateway{activity: new(activityBatch), addresses: gatewayAddresses{subnet: netip.MustParsePrefix("192.168.7.0/24")}, guest: net.HardwareAddr{0, 12, 41, 0, 0, mac}, mac: gatewayMAC(ip), ip: ip, link: channel.New(64, 1500, "")}
 		_, closeStack, err := g.startStack(ctx, server, "", "")
 		if err != nil {
 			t.Fatal(err)
@@ -186,6 +186,13 @@ func TestTwoGuestsWaitForOwnSOCKSReply(t *testing.T) {
 	silent()
 	c1.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
 	expect(g1, 4)
+	entries := g1.activity.drain()
+	if len(entries) != 2 || entries[0].Kind != "TCP" || entries[0].Message != "198.51.100.42:80 · 请求连接" || entries[1].Kind != "错误" {
+		t.Fatalf("failed guest activity: %+v", entries)
+	}
+	if entries = g2.activity.drain(); len(entries) != 1 || entries[0].Kind != "TCP" {
+		t.Fatalf("other guest activity: %+v", entries)
+	}
 	invalid := request(g1, 41004, requests1)
 	invalid.Write([]byte{4, 0, 0, 1, 127, 0, 0, 1, 0, 80})
 	expect(g1, 4)

@@ -9,7 +9,10 @@ import (
 	"strings"
 )
 
-type Config struct{ VM, Proxy, RESTPassword, DNS string }
+type Config struct {
+	VM, Proxy, RESTPassword, DNS string
+	AllowHostAccess              bool
+}
 
 const DefaultDNS = "8.8.8.8"
 

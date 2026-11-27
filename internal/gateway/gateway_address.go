@@ -93,7 +93,7 @@ func readGatewayScope(base []byte, subnet netip.Prefix) (gatewayAddresses, error
 				hasPool = true
 			case "option":
 				if (scopeDepth >= 0 || depth == 0) && len(fields) > 1 && fields[1] == "routers" {
-					return a, errors.New("Host-only 网段已有其他网关")
+					return a, errors.New("虚拟机所在网段已有其他网关")
 				}
 			}
 		}

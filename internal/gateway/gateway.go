@@ -15,6 +15,7 @@ import (
 
 	"github.com/xjasonlyu/tun2socks/v2/core"
 	"github.com/xjasonlyu/tun2socks/v2/core/adapter"
+	"github.com/xjasonlyu/tun2socks/v2/metadata"
 	"github.com/xjasonlyu/tun2socks/v2/proxy/socks5"
 	"github.com/xjasonlyu/tun2socks/v2/tunnel"
 	"github.com/xjasonlyu/tun2socks/v2/tunnel/statistic"
@@ -29,30 +30,47 @@ import (
 )
 
 type gatewayHandler struct {
+	activity *activityBatch
+	isolated bool
 	*tunnel.DeferredTCPHandler
-	lastTCP atomic.Int32
-	dialer  xproxy.ContextDialer
-	dns     *dnsrelay.Relay
-	ctx     context.Context
+
+	lastTCPError atomic.Pointer[string]
+	dialer       xproxy.ContextDialer
+	dns          *dnsrelay.Relay
+	ctx          context.Context
 }
 
 func (h *gatewayHandler) DialTCP(ctx context.Context, id stack.TransportEndpointID) (net.Conn, error) {
 	// The deferred forwarder creates the guest endpoint only after this returns.
 	// Read and validate the entire SOCKS5 CONNECT reply, including BND.ADDR and port.
+	destination := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+	if h.isolated && hostDestination(id.LocalAddress.AsSlice()) {
+		h.activity.add("阻断", "TCP "+destination+" · 隔离策略")
+		return nil, errors.New("隔离策略阻断宿主机地址")
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, 26*time.Second)
 	defer cancel()
-	destination := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+	h.activity.add("TCP", destination+" · 请求连接")
 	conn, err := h.dialer.DialContext(dialCtx, "tcp", destination)
 	if err != nil {
-		h.lastTCP.Store(-1)
+		detail := destination + " · " + err.Error()
+		h.activity.add("错误", "TCP "+detail)
+		h.lastTCPError.Store(&detail)
 	} else {
-		h.lastTCP.Store(1)
+		h.activity.add("TCP", destination+" · SOCKS5 已连接")
+		h.lastTCPError.Store(nil)
 	}
 	return conn, err
 }
 
 func (h *gatewayHandler) HandleUDP(c adapter.UDPConn) {
-	if c.ID().LocalPort != 53 {
+	id := c.ID()
+	if h.isolated && hostDestination(id.LocalAddress.AsSlice()) {
+		h.activity.add("阻断", "UDP "+net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))+" · 隔离策略")
+		c.Close()
+		return
+	}
+	if id.LocalPort != 53 {
 		h.DeferredTCPHandler.HandleUDP(c)
 		return
 	}
@@ -76,9 +94,12 @@ func (h *gatewayHandler) serveDNS(c adapter.UDPConn) {
 			return
 		}
 		ctx, cancel := context.WithTimeout(h.ctx, 6*time.Second)
+		query := dnsQuestion(msg[:n]) + " → " + target.String()
+		h.activity.add("DNS", query)
 		reply, err := h.dns.Exchange(ctx, target, msg[:n])
 		cancel()
 		if err != nil {
+			h.activity.add("错误", "DNS "+query+" · "+err.Error())
 			continue
 		}
 		if _, err = c.WriteTo(reply, from); err != nil {
@@ -88,13 +109,15 @@ func (h *gatewayHandler) serveDNS(c adapter.UDPConn) {
 }
 
 type gateway struct {
-	addresses   gatewayAddresses
-	guest, mac  net.HardwareAddr
-	ip          netip.Addr
-	hub         *networkHub
-	link        *channel.Endpoint
-	count       atomic.Uint64
-	answeredARP atomic.Bool
+	activity           *activityBatch
+	isolated           bool
+	addresses          gatewayAddresses
+	guest, mac         net.HardwareAddr
+	ip                 netip.Addr
+	hub                *networkHub
+	link               *channel.Endpoint
+	upBytes, downBytes atomic.Uint64
+	answeredARP        atomic.Bool
 }
 
 func (g *gateway) ethernet(data []byte, protocol uint16) error {
@@ -136,7 +159,7 @@ func (g *gateway) accept(frame []byte) error {
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame[14 : 14+size])})
 		g.link.InjectInbound(header.IPv4ProtocolNumber, pkt)
 		pkt.DecRef()
-		g.count.Add(1)
+		g.upBytes.Add(uint64(size))
 	}
 	return nil
 }
@@ -147,12 +170,15 @@ func (g *gateway) transmit(ctx context.Context) error {
 			return nil
 		}
 		b := pkt.ToBuffer()
-		e := g.ethernet(b.Flatten(), 0x0800)
+		data := b.Flatten()
+		size := len(data)
+		e := g.ethernet(data, 0x0800)
 		b.Release()
 		pkt.DecRef()
 		if e != nil {
 			return e
 		}
+		g.downBytes.Add(uint64(size))
 	}
 }
 
@@ -221,17 +247,11 @@ func selectPort(ctx context.Context, backends []frameBackend, probe func(context
 	return nil, "", fmt.Errorf("无法打开虚拟网卡：%s", strings.ReplaceAll(failures.Error(), "\n", " / "))
 }
 
-func (g *gateway) status(lease netip.Addr, lastTCP int32, linkErr error) string {
-	if n := g.count.Load(); n > 0 {
-		state := "已收到代理流量"
-		if lastTCP > 0 {
-			state = "最近一次 SOCKS5 TCP 连接成功"
-		} else if lastTCP < 0 {
-			state = "最近一次 SOCKS5 TCP 连接失败，已阻断该连接"
-		}
-		return fmt.Sprintf("%s · %d 个 IPv4 包", state, n)
+func (g *gateway) status(lease netip.Addr, linkErr error) string {
+	if g.upBytes.Load() > 0 {
+		return "已收到虚拟机代理流量"
 	}
-	parts := []string{"网关 " + g.ip.String() + " 已就绪"}
+	parts := []string{"网关 " + g.ip.String()}
 	if lease.IsValid() {
 		parts = append(parts, "DHCP 已分配 "+lease.String())
 	}
@@ -241,7 +261,22 @@ func (g *gateway) status(lease netip.Addr, lastTCP int32, linkErr error) string 
 	if linkErr != nil && !lease.IsValid() && !g.answeredARP.Load() {
 		parts = append(parts, "VMware 网卡重连失败："+strings.Join(strings.Fields(linkErr.Error()), " "))
 	}
-	return strings.Join(append(parts, "等待首个 TCP/UDP 包"), " · ")
+	return strings.Join(append(parts, "等待虚拟机续租或发起网络连接"), " · ")
+}
+
+type activityProxy struct {
+	*socks5.Socks5
+	activity *activityBatch
+}
+
+func (p activityProxy) DialUDP(m *metadata.Metadata) (net.PacketConn, error) {
+	dst := m.DestinationAddress()
+	p.activity.add("UDP", dst+" · 请求转发")
+	conn, err := p.Socks5.DialUDP(m)
+	if err != nil {
+		p.activity.add("错误", "UDP "+dst+" · "+err.Error())
+	}
+	return conn, err
 }
 
 func (g *gateway) startStack(ctx context.Context, server, user, password string) (*gatewayHandler, func(), error) {
@@ -258,10 +293,10 @@ func (g *gateway) startStack(ctx context.Context, server, user, password string)
 		return nil, nil, e
 	}
 	child, cancel := context.WithCancel(ctx)
-	t := tunnel.New(upstream, statistic.DefaultManager)
+	t := tunnel.New(activityProxy{upstream, g.activity}, statistic.DefaultManager)
 	t.ProcessAsync()
 
-	h := &gatewayHandler{DeferredTCPHandler: tunnel.NewDeferredTCPHandler(child, t), dialer: tcpDialer.(xproxy.ContextDialer), ctx: child}
+	h := &gatewayHandler{activity: g.activity, isolated: g.isolated, DeferredTCPHandler: tunnel.NewDeferredTCPHandler(child, t), dialer: tcpDialer.(xproxy.ContextDialer), ctx: child}
 	h.dns = dnsrelay.New(child, server, auth, h.dialer)
 	s, e := core.CreateStack(&core.Config{LinkEndpoint: g.link, TransportHandler: h, RejectIPv6: true, DeferredTCP: &core.DeferredTCPConfig{Context: child}})
 	if e != nil {
@@ -289,35 +324,41 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 	var dhcpInstalled bool
 	defer func() {
 		if reconnected != nil {
-			<-reconnected
-		}
-		if dhcpInstalled {
-			if err := m.dhcp.change(v, false); err != nil {
-				result = errors.Join(result, fmt.Errorf("撤销 DHCP: %w", err))
+			p.cleaning("等待 VMware 完成虚拟网卡重连")
+			if err := <-reconnected; err != nil {
+				p.cleanupErr = fmt.Errorf("虚拟网卡重连失败: %w", err)
 			}
 		}
+		if dhcpInstalled {
+			p.cleaning("正在撤销该网卡的 DHCP 配置并重新加载 DHCP 服务")
+			if err := m.dhcp.change(v, false); err != nil {
+				p.cleanupErr = errors.Join(p.cleanupErr, fmt.Errorf("撤销 DHCP: %w", err))
+			}
+		}
+		result = errors.Join(result, p.cleanupErr)
 	}()
 	p.step(openGateway, "active", "正在打开 "+v.Network+" 并选择网关地址")
 	guest, e := net.ParseMAC(v.MAC)
 	if e != nil {
 		return e
 	}
-	g := gateway{guest: guest, addresses: v.scope, link: channel.New(512, 1500, "")}
+	g := gateway{activity: p.activity, isolated: v.isolated, guest: guest, addresses: v.scope, link: channel.New(512, 1500, "")}
 	child, cancel := context.WithCancel(ctx)
 	defer cancel()
 	h, closeStack, e := g.startStack(child, server, user, password)
 	if e != nil {
 		return e
 	}
-	defer closeStack()
-	hub, e := m.networks.attach(child, v.Network, &g, []frameBackend{
-		{"VMware 驱动", func() (vmnet.Port, error) { return vmnet.Open(v.Network) }},
-		{"Npcap 回退", func() (vmnet.Port, error) { return vmnet.OpenNpcap(dev) }},
-	})
+	defer func() { p.cleaning("正在关闭代理连接和协议栈"); closeStack() }()
+	drivers := []frameBackend{{"VMware 驱动", func() (vmnet.Port, error) { return vmnet.Open(v.Network) }}}
+	if !v.isolated {
+		drivers = append(drivers, frameBackend{"Npcap 回退", func() (vmnet.Port, error) { return vmnet.OpenNpcap(dev) }})
+	}
+	hub, e := m.networks.attach(child, v.Network, &g, drivers)
 	if e != nil {
 		return e
 	}
-	defer m.networks.detach(v.Network, &g)
+	defer func() { p.cleaning("正在停止转发并释放虚拟网络端口"); m.networks.detach(v.Network, &g) }()
 	p.step(openGateway, "done", hub.backend+" · "+g.ip.String())
 	p.step(setDHCP, "active", "正在更新该网卡的 DHCP 配置")
 	since := time.Now()
@@ -332,7 +373,25 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 	go func() { results <- g.transmit(child) }()
 	waitingSince := time.Now()
 	var lease netip.Addr
-	previous := g.status(lease, 0, nil)
+	p.state.Stats.Server, p.state.Stats.DNS = server, v.dns.String()
+	sample := trafficSample{at: since}
+	var health atomic.Pointer[dnsrelay.Health]
+	monitorDone := make(chan struct{})
+	go func() {
+		defer close(monitorDone)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			result := h.dns.Check(child, v.dns)
+			health.Store(&result)
+			select {
+			case <-child.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	defer func() { cancel(); <-monitorDone }()
 
 	// Keep reporting while vmrun reconnects the NIC. Finish reconnecting even
 	// if Stop is pressed between disconnectNamedDevice and connectNamedDevice.
@@ -341,6 +400,10 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 		defer close(reconnected)
 		reconnected <- renewLink(v)
 	}()
+	guardFailure := make(chan error, 1)
+	guardDone := make(chan struct{})
+	go func() { defer close(guardDone); m.watchNetwork(child, v, guardFailure) }()
+	defer func() { cancel(); <-guardDone }()
 	var linkErr error
 	var nextLeaseRead time.Time
 	var linkResult <-chan error = reconnected
@@ -348,6 +411,12 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 	defer ticker.Stop()
 	for {
 		select {
+		case err := <-guardFailure:
+			cancel()
+			<-results
+			return err
+		case <-p.activity.flush:
+			p.report(p.state)
 		case err := <-results:
 			return err
 		case <-hub.done:
@@ -355,39 +424,59 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 			<-results
 			return hub.err
 		case linkErr = <-linkResult:
+			if linkErr != nil {
+				p.activity.add("错误", "虚拟网卡重连 · "+linkErr.Error())
+			}
 			linkResult = nil
+			reconnected = nil // The reconnect command has returned; no wait during shutdown.
 		case now := <-ticker.C:
-			if g.count.Load() == 0 && !now.Before(nextLeaseRead) {
+			before := p.state
+			up := g.upBytes.Load()
+			if up == 0 && !now.Before(nextLeaseRead) {
 				if observed := currentLease(v, since, now); observed.IsValid() {
 					lease = observed
 				}
 				nextLeaseRead = now.Add(3 * time.Second)
 			}
-			packets := g.count.Load()
-			if p.state.Phase != "ready" && (lease.IsValid() || packets > 0) {
+			p.state.Stats.sample(&sample, now, up, g.downBytes.Load())
+			if result := health.Load(); result != nil {
+				for _, probe := range []struct {
+					name              string
+					previous, current dnsrelay.CheckResult
+				}{
+					{"SOCKS5 服务", before.Stats.Health.Service, result.Service},
+					{"TCP 转发探测", before.Stats.Health.TCP, result.TCP},
+					{"UDP 转发探测", before.Stats.Health.UDP, result.UDP},
+				} {
+					if probe.previous != probe.current && (probe.current.State == "error" || probe.current.State == "unsupported") {
+						p.activity.add("上游", probe.name+" · "+probe.current.Detail)
+					}
+				}
+				p.state.Stats.Health = *result
+			}
+			p.state.Stats.LastTCPError = ""
+			if detail := h.lastTCPError.Load(); detail != nil {
+				p.state.Stats.LastTCPError = *detail
+			}
+			if p.state.Phase != "ready" && (lease.IsValid() || up > 0) {
 				evidence := "已收到虚拟机 TCP/UDP 流量"
 				if lease.IsValid() {
 					evidence = "已确认本次 DHCP 租约 " + lease.String()
 				}
 				p.step(confirmGuest, "done", evidence)
 			}
-			status := g.status(lease, h.lastTCP.Load(), linkErr)
-			if leaseHintDue(now.Sub(waitingSince), lease, g.count.Load()) {
-				status += " · 长时间未观察到本次 DHCP 租约，请在 guest 内禁用再启用网络连接设备"
+			status := g.status(lease, linkErr)
+			p.state.ShowGuestHelp = leaseHintDue(now.Sub(waitingSince), lease, up)
+			if p.state.Phase != "ready" {
+				p.state.Steps[confirmGuest].Detail = status
 			}
-			if status != previous {
-				if p.state.Phase == "ready" {
-					p.state.Status = status
-					p.report(p.state)
-				} else {
-					p.step(confirmGuest, "active", status)
-				}
-				previous = status
+			if p.state != before || p.activity.pending() {
+				p.report(p.state)
 			}
 		}
 	}
 }
 
-func leaseHintDue(elapsed time.Duration, lease netip.Addr, packets uint64) bool {
-	return elapsed >= 45*time.Second && !lease.IsValid() && packets == 0
+func leaseHintDue(elapsed time.Duration, lease netip.Addr, receivedBytes uint64) bool {
+	return elapsed >= 10*time.Second && !lease.IsValid() && receivedBytes == 0
 }

@@ -38,8 +38,8 @@ func TestSessionLeaseSelectsCurrentGuest(t *testing.T) {
 func TestIdleGatewayWithLeaseDoesNotWaitForRenewal(t *testing.T) {
 	g := gateway{ip: netip.MustParseAddr("192.168.7.2")}
 	lease := netip.MustParseAddr("192.168.7.131")
-	line := g.status(lease, 0, errors.New("reconnect failed"))
-	for _, label := range []string{"DHCP 已分配 192.168.7.131", "网关 192.168.7.2 已就绪", "等待首个 TCP/UDP 包"} {
+	line := g.status(lease, errors.New("reconnect failed"))
+	for _, label := range []string{"DHCP 已分配 192.168.7.131", "网关 192.168.7.2", "等待虚拟机续租或发起网络连接"} {
 		if !strings.Contains(line, label) {
 			t.Fatalf("missing %s in %s", label, line)
 		}
@@ -48,11 +48,11 @@ func TestIdleGatewayWithLeaseDoesNotWaitForRenewal(t *testing.T) {
 		t.Fatal(line)
 	}
 	g.answeredARP.Store(true)
-	if !strings.Contains(g.status(lease, 0, nil), "已应答") {
+	if !strings.Contains(g.status(lease, nil), "已应答") {
 		t.Fatal("missing ARP status")
 	}
-	g.count.Add(1)
-	if !strings.Contains(g.status(lease, 0, nil), "已收到代理流量") || !strings.Contains(g.status(lease, -1, nil), "连接失败") {
+	g.upBytes.Add(40)
+	if !strings.Contains(g.status(lease, nil), "已收到虚拟机代理流量") {
 		t.Fatal("missing traffic status")
 	}
 }

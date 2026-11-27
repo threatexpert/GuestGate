@@ -15,43 +15,51 @@ import (
 
 var errUDPUnsupported = errors.New("SOCKS5 UDP ASSOCIATE command unsupported")
 
-// Keep the numeric reply code: only REP 7 on the association request enables TCP DNS.
-func requestDNSAssociation(c net.Conn, auth *proxy.Auth) (socks5.Addr, error) {
+func negotiate(c net.Conn, auth *proxy.Auth) error {
 	methods := []byte{5, 1, 0}
 	if auth != nil {
 		methods = []byte{5, 2, 0, 2}
 	}
 	if _, err := c.Write(methods); err != nil {
-		return nil, err
+		return err
 	}
 	var reply [3]byte
 	if _, err := io.ReadFull(c, reply[:2]); err != nil {
-		return nil, err
+		return err
 	}
 	if reply[0] != 5 {
-		return nil, errors.New("invalid SOCKS5 negotiation")
+		return errors.New("invalid SOCKS5 negotiation")
 	}
 	switch reply[1] {
 	case 0:
 	case 2:
 		if auth == nil || len(auth.User) == 0 || len(auth.User) > 255 || len(auth.Password) == 0 || len(auth.Password) > 255 {
-			return nil, errors.New("invalid SOCKS5 credentials")
+			return errors.New("invalid SOCKS5 credentials")
 		}
 		msg := append([]byte{1, byte(len(auth.User))}, auth.User...)
 		msg = append(msg, byte(len(auth.Password)))
 		msg = append(msg, auth.Password...)
 		if _, err := c.Write(msg); err != nil {
-			return nil, err
+			return err
 		}
 		if _, err := io.ReadFull(c, reply[:2]); err != nil {
-			return nil, err
+			return err
 		}
 		if reply[0] != 1 || reply[1] != 0 {
-			return nil, errors.New("SOCKS5 authentication failed")
+			return errors.New("SOCKS5 authentication failed")
 		}
 	default:
-		return nil, errors.New("SOCKS5 authentication method unavailable")
+		return errors.New("SOCKS5 authentication method unavailable")
 	}
+	return nil
+}
+
+// Keep the numeric reply code: only REP 7 on the association request enables TCP DNS.
+func requestDNSAssociation(c net.Conn, auth *proxy.Auth) (socks5.Addr, error) {
+	if err := negotiate(c, auth); err != nil {
+		return nil, err
+	}
+	var reply [3]byte
 	if _, err := c.Write([]byte{5, byte(socks5.CmdUDPAssociate), 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
 		return nil, err
 	}

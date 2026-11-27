@@ -81,7 +81,7 @@ func dnsReplyCode(t *testing.T, c net.Conn, rep byte, port int) {
 func dnsStack(t *testing.T, l *net.TCPListener, user, password string) *gateway {
 	t.Helper()
 	ip := netip.MustParseAddr("192.168.7.2")
-	g := &gateway{guest: net.HardwareAddr{0, 12, 41, 0, 0, 1}, mac: gatewayMAC(ip), ip: ip, link: channel.New(64, 1500, "")}
+	g := &gateway{activity: new(activityBatch), guest: net.HardwareAddr{0, 12, 41, 0, 0, 1}, mac: gatewayMAC(ip), ip: ip, link: channel.New(64, 1500, "")}
 	_, stop, err := g.startStack(t.Context(), l.Addr().String(), user, password)
 	if err != nil {
 		t.Fatal(err)
@@ -94,6 +94,12 @@ func guestDNSQuery(t *testing.T, g *gateway, target string, port uint16, label b
 	t.Helper()
 	// All clients deliberately use the same transaction ID.
 	q := []byte{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, label, 0, 0, 1, 0, 1}
+	guestDatagram(t, g, target, port, 53, q)
+	return q
+}
+
+func guestDatagram(t *testing.T, g *gateway, target string, port, destination uint16, q []byte) {
+	t.Helper()
 	frame := make([]byte, 14+20+8+len(q))
 	copy(frame, g.mac)
 	copy(frame[6:], g.guest)
@@ -104,12 +110,31 @@ func guestDNSQuery(t *testing.T, g *gateway, target string, port uint16, label b
 	ip.Encode(&header.IPv4Fields{TotalLength: uint16(len(frame) - 14), TTL: 64, Protocol: 17, SrcAddr: src, DstAddr: dst})
 	ip.SetChecksum(^ip.CalculateChecksum())
 	udp := header.UDP(frame[34:42])
-	udp.Encode(&header.UDPFields{SrcPort: port, DstPort: 53, Length: uint16(len(q) + 8)})
+	udp.Encode(&header.UDPFields{SrcPort: port, DstPort: destination, Length: uint16(len(q) + 8)})
 	copy(frame[42:], q)
 	if err := g.accept(frame); err != nil {
 		t.Fatal(err)
 	}
-	return q
+}
+
+func TestGuestUDPActivityOnProxyRefusal(t *testing.T) {
+	l := dnsListener(t)
+	g := dnsStack(t, l, "", "")
+	guestDatagram(t, g, "192.0.2.15", 41000, 123, []byte{1})
+	c := acceptDNSControl(t, l, 0)
+	expectDNSCommand(t, c, 3, "0.0.0.0:0")
+	dnsReplyCode(t, c, 7, 0)
+	var entries []ActivityEntry
+	for until := time.Now().Add(2 * time.Second); time.Now().Before(until); {
+		entries = append(entries, g.activity.drain()...)
+		if len(entries) >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond * 10)
+	}
+	if len(entries) != 2 || entries[0].Kind != "UDP" || entries[0].Message != "192.0.2.15:123 · 请求转发" || entries[1].Kind != "错误" {
+		t.Fatalf("guest UDP activity: %+v", entries)
+	}
 }
 
 func expectGuestDNS(t *testing.T, g *gateway, target string, port uint16, query []byte) {
@@ -233,6 +258,10 @@ func TestGuestDNSTCPOnlyOnUnsupported(t *testing.T) {
 		payload[2] |= 0x80
 		writeDNSBytes(t, c, append(binary.BigEndian.AppendUint16(nil, size), payload...))
 		expectGuestDNS(t, g, target, port, q)
+		entries := g.activity.drain()
+		if len(entries) != 1 || entries[0].Kind != "DNS" || entries[0].Message != string('a'+rune(i))+". A → "+target+":53" {
+			t.Fatalf("DNS activity: %+v", entries)
+		}
 		c.Close()
 	}
 }
