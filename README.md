@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  欢迎扫码加入微信群讨论 <a href="./assets/wechat-qr.svg"><img src="./assets/wechat-qr.svg" width="57" height="57" align="absmiddle" alt="微信群二维码，点击放大"></a>
+  欢迎扫码加入微信群讨论 <a href="./wechat-qr.svg"><img src="./wechat-qr.svg" width="57" height="57" align="absmiddle" alt="微信群二维码，点击放大"></a>
 </p>
 
 ---
