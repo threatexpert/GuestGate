@@ -236,6 +236,11 @@ func TestGuestDNSRelayAndReconnect(t *testing.T) {
 }
 
 func TestGuestDNSTCPOnlyOnUnsupported(t *testing.T) {
+	t.Run("reply 07", func(t *testing.T) { testGuestDNSFallback(t, false) })
+	t.Run("EOF", func(t *testing.T) { testGuestDNSFallback(t, true) })
+}
+
+func testGuestDNSFallback(t *testing.T, closeWithoutReply bool) {
 	l := dnsListener(t)
 	g := dnsStack(t, l, "", "")
 	for i, target := range []string{"1.1.1.1", "8.8.8.8"} {
@@ -244,7 +249,9 @@ func TestGuestDNSTCPOnlyOnUnsupported(t *testing.T) {
 		if i == 0 {
 			c := acceptDNSControl(t, l, 0)
 			expectDNSCommand(t, c, 3, "0.0.0.0:0")
-			dnsReplyCode(t, c, 7, 0)
+			if !closeWithoutReply {
+				dnsReplyCode(t, c, 7, 0)
+			}
 			c.Close()
 		}
 		c := acceptDNSControl(t, l, 0)
@@ -254,6 +261,13 @@ func TestGuestDNSTCPOnlyOnUnsupported(t *testing.T) {
 		payload := readDNSBytes(t, c, int(size))
 		if !bytes.Equal(payload, q) {
 			t.Fatalf("wrong TCP DNS request %x", payload)
+		}
+		if i == 0 && !closeWithoutReply {
+			// A TCP DNS reply can arrive after the twelve-second UDP query deadline.
+			if err := c.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(13 * time.Second)
 		}
 		payload[2] |= 0x80
 		writeDNSBytes(t, c, append(binary.BigEndian.AppendUint16(nil, size), payload...))
@@ -267,20 +281,24 @@ func TestGuestDNSTCPOnlyOnUnsupported(t *testing.T) {
 }
 
 func TestDNSAssociateFailuresRetryUDP(t *testing.T) {
-	for _, failure := range []string{"authentication", "EOF", "malformed 07", "truncated 07", "general failure", "connection refused", "address unsupported"} {
+	for _, failure := range []string{"authentication", "authentication EOF", "partial header", "malformed 07", "truncated 07", "general failure", "connection refused", "address unsupported"} {
 		t.Run(failure, func(t *testing.T) {
 			l := dnsListener(t)
 			g := dnsStack(t, l, "guest", "secret")
 			guestDNSQuery(t, g, "1.1.1.1", 53201, 'a')
-			if failure == "authentication" {
+			if failure == "authentication" || failure == "authentication EOF" {
 				c := acceptDNSControl(t, l, 2)
 				readDNSBytes(t, c, 14)
-				writeDNSBytes(t, c, []byte{1, 7})
+				if failure == "authentication" {
+					writeDNSBytes(t, c, []byte{1, 7})
+				}
 				c.Close()
 			} else {
 				c := acceptDNSControl(t, l, 0)
 				expectDNSCommand(t, c, 3, "0.0.0.0:0")
 				switch failure {
+				case "partial header":
+					writeDNSBytes(t, c, []byte{5})
 				case "malformed 07":
 					writeDNSBytes(t, c, []byte{4, 7, 0, 1, 0, 0, 0, 0, 0, 0})
 				case "truncated 07":
@@ -301,6 +319,7 @@ func TestDNSAssociateFailuresRetryUDP(t *testing.T) {
 }
 
 func TestDNSUDPTimeoutRetainsAssociation(t *testing.T) {
+	t.Parallel()
 	l := dnsListener(t)
 	u := testUDPRelay(t)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -313,8 +332,9 @@ func TestDNSUDPTimeoutRetainsAssociation(t *testing.T) {
 	q := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1}
 	target := netip.MustParseAddrPort("1.1.1.1:53")
 	result := make(chan error, 1)
-	requestCtx, expire := context.WithTimeout(ctx, 500*time.Millisecond)
+	requestCtx, expire := context.WithTimeout(ctx, 20*time.Second)
 	defer expire()
+	started := time.Now()
 	go func() { _, e := r.Exchange(requestCtx, target, q); result <- e }()
 	c := acceptDNSControl(t, l, 0)
 	expectDNSCommand(t, c, 3, "0.0.0.0:0")
@@ -322,6 +342,9 @@ func TestDNSUDPTimeoutRetainsAssociation(t *testing.T) {
 	readRelayDNS(t, u, target.String())
 	if err = <-result; err != context.DeadlineExceeded {
 		t.Fatalf("UDP loss: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 12*time.Second || requestCtx.Err() != nil {
+		t.Fatalf("UDP query did not use its twelve-second deadline: %v", elapsed)
 	}
 	next, stop := context.WithTimeout(ctx, 2*time.Second)
 	defer stop()

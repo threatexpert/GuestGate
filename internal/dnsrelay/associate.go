@@ -14,6 +14,7 @@ import (
 )
 
 var errUDPUnsupported = errors.New("SOCKS5 UDP ASSOCIATE command unsupported")
+var errUDPAssociateEOF = fmt.Errorf("%w: EOF before command reply", errUDPUnsupported)
 
 func negotiate(c net.Conn, auth *proxy.Auth) error {
 	methods := []byte{5, 1, 0}
@@ -54,7 +55,6 @@ func negotiate(c net.Conn, auth *proxy.Auth) error {
 	return nil
 }
 
-// Keep the numeric reply code: only REP 7 on the association request enables TCP DNS.
 func requestDNSAssociation(c net.Conn, auth *proxy.Auth) (socks5.Addr, error) {
 	if err := negotiate(c, auth); err != nil {
 		return nil, err
@@ -63,7 +63,11 @@ func requestDNSAssociation(c net.Conn, auth *proxy.Auth) (socks5.Addr, error) {
 	if _, err := c.Write([]byte{5, byte(socks5.CmdUDPAssociate), 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
 		return nil, err
 	}
-	if _, err := io.ReadFull(c, reply[:]); err != nil {
+	if n, err := io.ReadFull(c, reply[:]); err != nil {
+		// Some TCP-only proxies close on UDP ASSOCIATE without sending a reply.
+		if n == 0 && errors.Is(err, io.EOF) {
+			return nil, errUDPAssociateEOF
+		}
 		return nil, err
 	}
 	if reply[0] != 5 || reply[2] != 0 {

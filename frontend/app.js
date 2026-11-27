@@ -171,6 +171,20 @@ function createCard(key,state) {
     try {await api.StopVM(row?.vm.Path || key);await updateStates();}
     catch(e){card.querySelector(".session-error").textContent=String(e);card.querySelector(".stop").disabled=false;}
   };
+  const probe=card.querySelector(".probe-upstream");
+  probe.onclick=async()=>{
+    const error=card.querySelector(".session-error");
+    error.textContent="";
+    probe.dataset.sending="true";
+    probe.disabled=true;
+    setText(probe,"探测中…");
+    try {await api.ProbeUpstream(machines.get(key)?.vm.Path || key);await updateStates();}
+    catch(e){error.textContent="无法发起探测："+String(e);}
+    finally {
+      delete probe.dataset.sending;
+      if (states[key]) showTelemetry(card,states[key]);
+    }
+  };
   cards.set(key,card);
   el("sessions").prepend(card);
   return card;
@@ -185,13 +199,7 @@ function formatBytes(bytes) {
 
 function sessionBadge(state) {
   if (state.Phase === "starting") return {tone:"waiting", text:"尚未就绪"};
-  if (state.Phase !== "ready") return {tone:state.Phase, text:phaseNames[state.Phase]};
-  const health = state.Stats?.Health;
-  if (!health?.CheckedAt) return {tone:"waiting", text:"已接入 · 正在检测上游"};
-  if (health.Service.State !== "ok") return {tone:"error", text:"已接入 · 上游异常"};
-  if (health.TCP.State === "ok" && ["ok","unsupported"].includes(health.UDP.State))
-    return {tone:"ready", text:"已就绪 · 代理运行中"};
-  return {tone:"warning", text:"已接入 · 转发探测异常"};
+  return {tone:state.Phase, text:state.Phase === "ready" ? "已就绪" : phaseNames[state.Phase]};
 }
 
 function showTelemetry(card, state) {
@@ -204,15 +212,19 @@ function showTelemetry(card, state) {
   }
   setLiveText(panel.querySelector(".server-address"), stats.Server);
   const health = stats.Health;
+  const probe = panel.querySelector(".probe-upstream");
+  const probing = !!stats.Probing || !!probe.dataset.sending;
+  probe.disabled = probing;
+  setText(probe, probing ? "探测中…" : "探测上游代理");
   for (const row of panel.querySelectorAll("[data-check]")) {
     const key = row.dataset.check, result = health?.[key];
-    const labels = {ok:key === "Service" ? "正常" : "可用", error:key === "Service" ? "异常" : "探测失败", unsupported:"不支持", blocked:"上游异常"};
-    row.dataset.state = result?.State || "pending";
-    setText(row.querySelector("b"), labels[row.dataset.state] || "检测中");
-    setText(row.querySelector("small"), result?.Detail || "");
+    const labels = {ok:key === "Service" ? "正常" : "可用", error:key === "Service" ? "异常" : "探测失败", unsupported:"不支持", blocked:"未执行", probing:"探测中"};
+    row.dataset.state = probing ? "probing" : result?.State || "pending";
+    setText(row.querySelector("b"), labels[row.dataset.state] || "未探测");
+    setText(row.querySelector("small"), probing ? "" : result?.Detail || (result?.State === "blocked" ? "SOCKS5 服务检查失败" : ""));
   }
-  const checked = health?.CheckedAt ? new Date(health.CheckedAt * 1000).toLocaleTimeString("zh-CN",{hour12:false}) + " 检测" : "正在检测";
-  setLiveText(panel.querySelector(".check-note"), checked + " · TCP / UDP 探测目标 " + stats.DNS + ":53");
+  const checked = !probing && health?.CheckedAt ? "上次探测 " + new Date(health.CheckedAt * 1000).toLocaleTimeString("zh-CN",{hour12:false}) + " · " : "";
+  setLiveText(panel.querySelector(".check-note"), checked + "TCP / UDP 探测目标 " + stats.DNS + ":53");
   setLiveText(panel.querySelector(".dial-error"), stats.LastTCPError ? "最近一次虚拟机 TCP 连接失败 · " + stats.LastTCPError : "");
 }
 

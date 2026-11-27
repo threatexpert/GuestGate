@@ -17,7 +17,7 @@ import (
 // Exercise the service greeting and both paths through a local SOCKS server.
 // No external resolver is contacted.
 func TestSessionHealth(t *testing.T) {
-	for _, mode := range []string{"both", "no-udp", "bad-greeting", "closed"} {
+	for _, mode := range []string{"both", "no-udp", "udp-eof", "bad-greeting", "closed"} {
 		t.Run(mode, func(t *testing.T) {
 			l := dnsListener(t)
 			u := testUDPRelay(t)
@@ -45,7 +45,7 @@ func TestSessionHealth(t *testing.T) {
 				defer c.Close()
 				readDNSBytes(t, c, 3)
 				writeDNSBytes(t, c, []byte{4, 0})
-			case "both", "no-udp":
+			case "both", "no-udp", "udp-eof":
 				acceptDNSControl(t, l, 0).Close()
 				for i := 0; i < 2; i++ {
 					c := acceptDNSControl(t, l, 0)
@@ -61,6 +61,10 @@ func TestSessionHealth(t *testing.T) {
 						query[2] |= 0x80
 						writeDNSBytes(t, c, append(size, query...))
 					case 3:
+						if mode == "udp-eof" {
+							c.Close()
+							continue
+						}
 						if mode == "no-udp" {
 							dnsReplyCode(t, c, 7, 0)
 							continue
@@ -81,9 +85,12 @@ func TestSessionHealth(t *testing.T) {
 				if h.Service.State != "ok" || h.TCP.State != "ok" || h.UDP.State != "ok" {
 					t.Fatal(h)
 				}
-			case "no-udp":
+			case "no-udp", "udp-eof":
 				if h.Service.State != "ok" || h.TCP.State != "ok" || h.UDP.State != "unsupported" {
 					t.Fatal(h)
+				}
+				if mode == "udp-eof" && !strings.Contains(h.UDP.Detail, "EOF") {
+					t.Fatal(h.UDP)
 				}
 			default:
 				if h.Service.State != "error" || h.TCP.State != "blocked" || h.UDP.State != "blocked" {
@@ -94,6 +101,20 @@ func TestSessionHealth(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestProbeTargetsRequestedSession(t *testing.T) {
+	first, second := make(chan struct{}, 1), make(chan struct{}, 1)
+	m := manager{sessions: map[string]sessionControl{
+		"one.vmx": {probe: first},
+		"two.vmx": {probe: second},
+	}}
+	m.probe("missing.vmx")
+	m.probe("TWO.vmx")
+	m.probe("two.vmx")
+	if len(first) != 0 || len(second) != 1 {
+		t.Fatal("expected one pending probe for the selected session only")
 	}
 }
 

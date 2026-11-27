@@ -199,6 +199,19 @@ func (a *App) StartVMWithHostAccess(vm, proxy, dns, restPassword string, allowHo
 	a.activity.record(vm, "GuestGate", "正在启用代理")
 	return nil
 }
+func (a *App) ProbeUpstream(vm string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state := a.states[strings.ToLower(vm)]
+	if a.closing || a.pipe == nil || !state.Running || state.Phase != "ready" {
+		return fmt.Errorf("虚拟机会话尚未就绪或已停止")
+	}
+	if state.Stats.Probing {
+		return nil
+	}
+	return json.NewEncoder(a.pipe).Encode(gateway.WorkerCommand{Action: "probe", Config: gateway.Config{VM: vm}})
+}
+
 func (a *App) StopVM(vm string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()

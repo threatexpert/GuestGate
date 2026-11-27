@@ -95,6 +95,9 @@ func (r *Relay) exchange(ctx context.Context, target netip.AddrPort, query []byt
 	if len(query) < 12 || len(query) > 65535 {
 		return nil, errors.New("invalid DNS message length")
 	}
+	// Bound UDP setup and exchange together. TCP fallback uses the original query deadline.
+	udpCtx, cancelUDP := context.WithTimeout(ctx, 12*time.Second)
+	defer cancelUDP()
 	r.first.Do(func() { close(r.demand) })
 	for {
 		r.mu.Lock()
@@ -110,14 +113,14 @@ func (r *Relay) exchange(ctx context.Context, target netip.AddrPort, query []byt
 			select {
 			case <-a.done:
 			default:
-				return a.exchange(ctx, target, query)
+				return a.exchange(udpCtx, target, query)
 			}
 		}
 		select {
 		case <-r.ctx.Done():
 			return nil, r.ctx.Err()
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-udpCtx.Done():
+			return nil, udpCtx.Err()
 		case <-changed:
 		}
 	}

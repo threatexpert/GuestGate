@@ -29,6 +29,8 @@ import (
 	"guestgate/internal/vmnet"
 )
 
+const proxyTCPTimeout = 26 * time.Second
+
 type gatewayHandler struct {
 	activity *activityBatch
 	isolated bool
@@ -48,7 +50,7 @@ func (h *gatewayHandler) DialTCP(ctx context.Context, id stack.TransportEndpoint
 		h.activity.add("阻断", "TCP "+destination+" · 隔离策略")
 		return nil, errors.New("隔离策略阻断宿主机地址")
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 26*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, proxyTCPTimeout)
 	defer cancel()
 	h.activity.add("TCP", destination+" · 请求连接")
 	conn, err := h.dialer.DialContext(dialCtx, "tcp", destination)
@@ -93,7 +95,7 @@ func (h *gatewayHandler) serveDNS(c adapter.UDPConn) {
 		if err != nil {
 			return
 		}
-		ctx, cancel := context.WithTimeout(h.ctx, 6*time.Second)
+		ctx, cancel := context.WithTimeout(h.ctx, proxyTCPTimeout)
 		query := dnsQuestion(msg[:n]) + " → " + target.String()
 		h.activity.add("DNS", query)
 		reply, err := h.dns.Exchange(ctx, target, msg[:n])
@@ -317,7 +319,7 @@ func (g *gateway) startStack(ctx context.Context, server, user, password string)
 	}, nil
 }
 
-func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, password string, p *setupProgress) (result error) {
+func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, password string, p *setupProgress, probe <-chan struct{}) (result error) {
 	// Detach and shut down this guest's stack before waiting for vmrun or
 	// restarting DHCP. Existing VMnet peers retain their own data paths.
 	var reconnected chan error
@@ -375,23 +377,13 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 	var lease netip.Addr
 	p.state.Stats.Server, p.state.Stats.DNS = server, v.dns.String()
 	sample := trafficSample{at: since}
-	var health atomic.Pointer[dnsrelay.Health]
-	monitorDone := make(chan struct{})
-	go func() {
-		defer close(monitorDone)
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			result := h.dns.Check(child, v.dns)
-			health.Store(&result)
-			select {
-			case <-child.Done():
-				return
-			case <-ticker.C:
-			}
+	var probeResult chan dnsrelay.Health
+	defer func() {
+		if probeResult != nil {
+			cancel()
+			<-probeResult
 		}
 	}()
-	defer func() { cancel(); <-monitorDone }()
 
 	// Keep reporting while vmrun reconnects the NIC. Finish reconnecting even
 	// if Stop is pressed between disconnectNamedDevice and connectNamedDevice.
@@ -417,6 +409,31 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 			return err
 		case <-p.activity.flush:
 			p.report(p.state)
+		case <-probe:
+			if probeResult != nil || p.state.Phase != "ready" || child.Err() != nil {
+				continue
+			}
+			probeResult = make(chan dnsrelay.Health, 1)
+			p.state.Stats.Probing = true
+			p.report(p.state)
+			go func(out chan<- dnsrelay.Health) { out <- h.dns.Check(child, v.dns) }(probeResult)
+		case health := <-probeResult:
+			probeResult = nil
+			p.state.Stats.Probing = false
+			p.state.Stats.Health = health
+			for _, check := range []struct {
+				name   string
+				result dnsrelay.CheckResult
+			}{
+				{"SOCKS5 服务", health.Service},
+				{"TCP 转发探测", health.TCP},
+				{"UDP 转发探测", health.UDP},
+			} {
+				if check.result.State == "error" || check.result.State == "unsupported" {
+					p.activity.add("上游", check.name+" · "+check.result.Detail)
+				}
+			}
+			p.report(p.state)
 		case err := <-results:
 			return err
 		case <-hub.done:
@@ -439,21 +456,6 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 				nextLeaseRead = now.Add(3 * time.Second)
 			}
 			p.state.Stats.sample(&sample, now, up, g.downBytes.Load())
-			if result := health.Load(); result != nil {
-				for _, probe := range []struct {
-					name              string
-					previous, current dnsrelay.CheckResult
-				}{
-					{"SOCKS5 服务", before.Stats.Health.Service, result.Service},
-					{"TCP 转发探测", before.Stats.Health.TCP, result.TCP},
-					{"UDP 转发探测", before.Stats.Health.UDP, result.UDP},
-				} {
-					if probe.previous != probe.current && (probe.current.State == "error" || probe.current.State == "unsupported") {
-						p.activity.add("上游", probe.name+" · "+probe.current.Detail)
-					}
-				}
-				p.state.Stats.Health = *result
-			}
 			p.state.Stats.LastTCPError = ""
 			if detail := h.lastTCPError.Load(); detail != nil {
 				p.state.Stats.LastTCPError = *detail

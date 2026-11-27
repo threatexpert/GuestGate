@@ -96,6 +96,7 @@ details[open]>.config-head::after{transform:rotate(225deg);margin-top:6px}#save-
 .speeds strong{font-size:clamp(16px,2.4vw,26px);font-variant-numeric:tabular-nums;color:#174d43}
 .speeds span,.speeds small,.check-note,.health-list small{font-size:12px;color:#526972}
 .upstream-head{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;margin-top:16px}.server-address{overflow-wrap:anywhere}
+.probe-upstream{margin-inline-start:auto;font-size:12px;padding:4px 9px}
 .health-list{margin:6px 0}.health-list>div{display:grid;grid-template-columns:76px 1fr;align-items:baseline;gap:8px;padding:4px 0}
 .health-list dd{margin:0;min-width:0}.health-list b{font-size:12px;font-weight:600;background:#ebeff1;color:#4e626e;padding:2px 7px;border-radius:4px}
 .health-list [data-state=ok] b{background:#e3f2e9;color:#1d6747}

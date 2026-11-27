@@ -70,6 +70,8 @@ func pathResult(err error) CheckResult {
 	switch {
 	case err == nil:
 		return CheckResult{State: "ok"}
+	case errors.Is(err, errUDPAssociateEOF):
+		return CheckResult{"unsupported", "上游收到 UDP ASSOCIATE 后直接关闭连接（EOF），DNS 自动使用 TCP"}
 	case errors.Is(err, errUDPUnsupported):
 		return CheckResult{"unsupported", "上游不支持 UDP ASSOCIATE，DNS 自动使用 TCP"}
 	default:

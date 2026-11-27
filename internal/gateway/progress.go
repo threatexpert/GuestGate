@@ -9,6 +9,7 @@ import (
 type SessionStats struct {
 	Server, DNS, LastTCPError string
 	Health                    dnsrelay.Health
+	Probing                   bool
 	UpBytes, DownBytes        uint64
 	UpRate, DownRate          uint64
 }

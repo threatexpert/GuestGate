@@ -14,9 +14,14 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+type sessionControl struct {
+	cancel context.CancelFunc
+	probe  chan struct{}
+}
+
 type manager struct {
 	mu       sync.Mutex
-	sessions map[string]context.CancelFunc
+	sessions map[string]sessionControl
 	lock     windows.Handle
 	wg       sync.WaitGroup
 	setup    sync.Mutex
@@ -40,7 +45,7 @@ func (m *manager) start(cfg Config, report func(VMState, []ActivityEntry)) {
 	key := strings.ToLower(cfg.VM)
 	m.mu.Lock()
 	if m.sessions == nil {
-		m.sessions = make(map[string]context.CancelFunc)
+		m.sessions = make(map[string]sessionControl)
 	}
 	if _, ok := m.sessions[key]; ok {
 		m.mu.Unlock()
@@ -64,13 +69,14 @@ func (m *manager) start(cfg Config, report func(VMState, []ActivityEntry)) {
 		m.lock = lock
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	m.sessions[key] = cancel
+	probe := make(chan struct{}, 1)
+	m.sessions[key] = sessionControl{cancel: cancel, probe: probe}
 	m.wg.Add(1)
 	m.mu.Unlock()
 	go func() {
 		defer m.wg.Done()
 		p.report(p.state)
-		err := m.run(ctx, cfg, p)
+		err := m.run(ctx, cfg, p, probe)
 		stopped := ctx.Err() != nil
 		cancel()
 		m.mu.Lock()
@@ -87,15 +93,24 @@ func (m *manager) start(cfg Config, report func(VMState, []ActivityEntry)) {
 func (m *manager) stop(path string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if cancel := m.sessions[strings.ToLower(path)]; cancel != nil {
-		cancel()
+	if session, ok := m.sessions[strings.ToLower(path)]; ok {
+		session.cancel()
+	}
+}
+
+func (m *manager) probe(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	select {
+	case m.sessions[strings.ToLower(path)].probe <- struct{}{}:
+	default:
 	}
 }
 
 func (m *manager) shutdown() {
 	m.mu.Lock()
-	for _, cancel := range m.sessions {
-		cancel()
+	for _, session := range m.sessions {
+		session.cancel()
 	}
 	m.mu.Unlock()
 	m.wg.Wait()
@@ -188,7 +203,7 @@ func (m *manager) prepare(ctx context.Context, cfg Config, p *setupProgress) (VM
 	}
 	return VM{}, "", errors.New("找不到运行中的虚拟机")
 }
-func (m *manager) run(ctx context.Context, cfg Config, p *setupProgress) error {
+func (m *manager) run(ctx context.Context, cfg Config, p *setupProgress, probe <-chan struct{}) error {
 	server, user, pass, err := ParseProxy(cfg.Proxy)
 	if err != nil {
 		return err
@@ -197,7 +212,7 @@ func (m *manager) run(ctx context.Context, cfg Config, p *setupProgress) error {
 	if err != nil {
 		return err
 	}
-	return m.gatewayRun(ctx, v, dev, server, user, pass, p)
+	return m.gatewayRun(ctx, v, dev, server, user, pass, p, probe)
 }
 
 func ServeManager(in io.Reader, out io.Writer) error {
@@ -221,6 +236,8 @@ func ServeManager(in io.Reader, out io.Writer) error {
 			})
 		case "stop":
 			m.stop(cmd.VM)
+		case "probe":
+			m.probe(cmd.VM)
 		default:
 			return errors.New("未知网关指令")
 		}
