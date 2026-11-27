@@ -378,6 +378,11 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 	p.state.Stats.Server, p.state.Stats.DNS = server, v.dns.String()
 	sample := trafficSample{at: since}
 	var probeResult chan dnsrelay.Health
+	startProbe := func() {
+		probeResult = make(chan dnsrelay.Health, 1)
+		p.state.Stats.Probing = true
+		go func(out chan<- dnsrelay.Health) { out <- h.dns.Check(child, v.dns) }(probeResult)
+	}
 	defer func() {
 		if probeResult != nil {
 			cancel()
@@ -413,10 +418,8 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 			if probeResult != nil || p.state.Phase != "ready" || child.Err() != nil {
 				continue
 			}
-			probeResult = make(chan dnsrelay.Health, 1)
-			p.state.Stats.Probing = true
+			startProbe()
 			p.report(p.state)
-			go func(out chan<- dnsrelay.Health) { out <- h.dns.Check(child, v.dns) }(probeResult)
 		case health := <-probeResult:
 			probeResult = nil
 			p.state.Stats.Probing = false
@@ -460,11 +463,12 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 			if detail := h.lastTCPError.Load(); detail != nil {
 				p.state.Stats.LastTCPError = *detail
 			}
-			if p.state.Phase != "ready" && (lease.IsValid() || up > 0) {
+			if p.state.Phase == "starting" && child.Err() == nil && (lease.IsValid() || up > 0) {
 				evidence := "已收到虚拟机 TCP/UDP 流量"
 				if lease.IsValid() {
 					evidence = "已确认本次 DHCP 租约 " + lease.String()
 				}
+				startProbe()
 				p.step(confirmGuest, "done", evidence)
 			}
 			status := g.status(lease, linkErr)
