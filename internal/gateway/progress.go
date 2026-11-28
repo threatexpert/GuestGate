@@ -7,11 +7,12 @@ import (
 )
 
 type SessionStats struct {
-	Server, DNS, LastTCPError string
-	Health                    dnsrelay.Health
-	Probing                   bool
-	UpBytes, DownBytes        uint64
-	UpRate, DownRate          uint64
+	TCPConnections, UDPControls int
+	Server, DNS, LocalTCPError  string
+	Health                      dnsrelay.Health
+	Probing                     bool
+	UpBytes, DownBytes          uint64
+	UpRate, DownRate            uint64
 }
 
 type trafficSample struct {
@@ -33,12 +34,15 @@ type SetupStep struct {
 }
 
 type VMState struct {
-	IsolatedNetwork string
-	Running         bool
-	ShowGuestHelp   bool
-	Phase, Status   string
-	Steps           [5]SetupStep
-	Stats           SessionStats
+	SessionID                          string
+	Recording                          bool
+	RecordingDirectory, RecordingError string
+	IsolatedNetwork                    string
+	Running                            bool
+	ShowGuestHelp                      bool
+	Phase, Status                      string
+	Steps                              [5]SetupStep
+	Stats                              SessionStats
 }
 
 const (
@@ -89,6 +93,8 @@ func (p *setupProgress) step(index int, state, detail string) {
 
 func (s VMState) Finished(err error, stopped bool) VMState {
 	s.Running = false
+	s.Recording = false
+	s.Stats.TCPConnections, s.Stats.UDPControls = 0, 0
 	s.ShowGuestHelp = false
 	s.Phase, s.Status = "stopped", "已停止代理"
 	for i := range s.Steps {

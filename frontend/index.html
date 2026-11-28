@@ -3,11 +3,11 @@
 <title>GuestGate</title><link rel="icon" href="guestgate.ico"><link rel="stylesheet" href="style.css"></head>
 <body><header class="appbar"><div class="brand"><span class="brandmark" aria-hidden="true"></span><div class="brand-copy">
 <div class="brand-title"><h1>GuestGate</h1><small id="app-version" class="brand-version">v1.0.3</small><a class="header-link" id="open-about" href="#about-dialog" aria-haspopup="dialog" aria-controls="about-dialog">关于</a></div>
-<p class="subtitle">VMware 虚拟机透明代理网关 · 客户机流量仅经 SOCKS5 出口，杜绝直连泄露 <a class="header-link" id="open-guide" href="#guide-dialog" aria-haspopup="dialog" aria-controls="guide-dialog">工作原理</a></p>
+<p class="subtitle">VMware 虚拟机透明代理网关 · 客户机流量仅经指定代理出口，杜绝直连泄露 <a class="header-link" id="open-guide" href="#guide-dialog" aria-haspopup="dialog" aria-controls="guide-dialog">工作原理</a></p>
 </div></div></header>
 <dialog id="about-dialog" class="app-dialog" aria-labelledby="about-title">
 <div class="brand"><span class="brandmark" aria-hidden="true"></span><h2 id="about-title">关于 GuestGate <small id="about-version"></small></h2></div>
-<p>GuestGate 是一款开源的 VMware 虚拟机透明代理网关。你可以在 Windows 宿主机上为每台虚拟机指定 SOCKS5 代理，无需在客户机里逐个配置应用。</p>
+<p>GuestGate 是一款开源的 VMware 虚拟机透明代理网关。你可以在 Windows 宿主机上为每台虚拟机指定上游代理，无需在客户机里逐个配置应用。</p>
 <a id="about-project" href="https://github.com/threatexpert/GuestGate">在 GitHub 查看源码或反馈问题 ↗</a>
 <p class="quiet">MIT 许可证 · © 2026 threatexpert.cn</p>
 <form method="dialog" class="guide-actions"><button class="primary" autofocus>关闭</button></form>
@@ -21,12 +21,23 @@
 <p class="guide-result"><strong>可靠性闭环：</strong> GuestGate 是虚拟机通往外部的唯一桥梁。无论代理服务停止、程序意外退出还是上游节点故障，桥梁断开即刻彻底断网。</p>
 <form method="dialog" class="guide-actions"><button class="primary" autofocus>关闭</button></form>
 </dialog>
+<dialog id="network-modes-dialog" class="app-dialog" aria-labelledby="network-modes-title">
+<h2 id="network-modes-title">两种模式的说明</h2>
+<table class="network-modes">
+<thead><tr><th scope="col">网络行为</th><th scope="col">严格隔离模式</th><th scope="col">仅主机模式</th></tr></thead>
+<tbody>
+<tr><th scope="row">虚拟机互访</th><td>无法直接互访。</td><td>同一仅主机网段内可直接互访。</td></tr>
+<tr><th scope="row">宿主机端口</th><td>无法访问。</td><td>可访问宿主机对该网段开放且防火墙放行的端口。</td></tr>
+</tbody></table>
+<p class="guide-result">两种模式都通过指定的上游代理访问外网。停止代理后，网卡仍留在所选网络，本地互访范围见上表。</p>
+<form method="dialog" class="guide-actions"><button class="primary" autofocus>关闭</button></form>
+</dialog>
 <dialog id="node-ports-dialog" class="app-dialog" aria-labelledby="node-ports-title">
 <h2 id="node-ports-title">如何为每个 Clash 节点分配独立本地端口</h2>
 <ol class="guide-body">
   <li>在宿主机运行 FlClash 或 Clash Verge Rev，并启用含有节点的订阅。</li>
   <li><strong>FlClash</strong>：右键目标配置，打开「扩展」并选择「脚本」。在「前往配置脚本」中新建脚本、粘贴并保存，返回选中它，点「立即应用」。<br><strong>Clash Verge Rev</strong>：右键目标订阅，打开「扩展脚本」（部分版本叫「编辑脚本」），粘贴并保存。启用该订阅并切到规则模式。</li>
-  <li>在客户端的「端口对照」代理组查看节点对应的端口。例如，虚拟机 A 的上游 SOCKS5 填 <code>127.0.0.1:18901</code>，虚拟机 B 填 <code>127.0.0.1:18902</code>。分别启用代理并核对出口 IP。</li>
+  <li>在客户端的「端口对照」代理组查看节点对应的端口。例如，虚拟机 A 的上游代理填 <code>127.0.0.1:18901</code>，虚拟机 B 填 <code>127.0.0.1:18902</code>。分别启用代理并核对出口 IP。</li>
 </ol>
 <p class="guide-result">脚本会把这份配置的分流规则替换为全部走「主出口」。端口按节点顺序分配，订阅更新后请重新核对。</p>
 <form method="dialog" class="guide-actions node-ports-actions"><span id="node-ports-status" role="status"></span><button type="button" id="copy-node-ports" class="primary">复制脚本</button><button>关闭</button></form>
@@ -49,23 +60,73 @@
 <p class="path" id="encrypted-note" hidden>此虚拟机已加密。启用时将自动读取 Windows 为它保存的密码。</p>
 <div class="network" id="network"></div>
 <form id="settings"><div class="fields">
-<div class="proxy-field"><div class="proxy-heading"><label for="proxy-address">上游 SOCKS5</label><a href="#node-ports-dialog" aria-haspopup="dialog" aria-controls="node-ports-dialog">为虚拟机指定 Clash 节点</a></div><input id="proxy-address" name="proxy" autocomplete="off" spellcheck="false" placeholder="host:port 或 socks5://用户:密码@host:port"></div>
+<div class="proxy-field"><div class="proxy-heading"><label for="proxy-address">上游代理</label><a href="#node-ports-dialog" aria-haspopup="dialog" aria-controls="node-ports-dialog">为虚拟机指定 Clash 节点</a></div><div class="proxy-editor"><input id="proxy-address" name="proxy" autocomplete="off" spellcheck="false" placeholder="host:port、http://… 或 socks5s://…?psk=…" title="支持 SOCKS5、HTTP CONNECT 和 GONC SOCKS5S"><button id="proxy-eye" type="button" hidden aria-controls="proxy-address" aria-pressed="false" aria-label="显示代理密钥" title="显示代理密钥"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/><path class="eye-slash" d="m3 3 18 18"/></svg></button></div></div>
 <label>DNS 服务器<input name="dns" autocomplete="off" spellcheck="false" placeholder="可留空，默认使用 8.8.8.8"></label>
 <label id="rest-label" hidden>VMware REST 密码<input name="rest" type="password" autocomplete="off"></label>
-</div><label class="host-policy"><input type="checkbox" name="blockHost" checked>启用严格隔离模式（不勾选则使用仅主机模式）</label>
+</div><div class="mode-option">
+<label class="host-policy"><input type="checkbox" name="blockHost" checked>启用严格隔离模式（不勾选则使用仅主机模式）</label>
+<a class="capture-link" href="#network-modes-dialog" aria-haspopup="dialog" aria-controls="network-modes-dialog">两种模式的说明</a>
+</div>
 <label class="host-policy"><input type="checkbox" name="confirmExit" checked>启动时确认出口IP</label>
+<section class="capture-config" aria-labelledby="capture-heading">
+<div class="capture-heading"><h3 id="capture-heading">解密与录制</h3><a class="capture-link" href="#capture-dialog" aria-haspopup="dialog" aria-controls="capture-dialog">证书与录制目录</a></div>
+<label class="host-policy"><input name="recordTraffic" type="checkbox">启动代理时自动录制 TCP/UDP 流量并尝试解密 TLS</label>
+<p class="quiet" id="capture-help" hidden>首次使用，请将宿主机 CA 导入客户机的受信任根证书。</p>
+<details class="recording-help"><summary>录制说明</summary><p>开始录制后，新建的 TLS 连接可尝试解密。要录制已有 TLS 连接，请让应用重新连接。停止录制后，已有连接继续传输，后续流量不再写入录制文件。</p></details>
+</section>
+
 <div class="actions"><div><p class="quiet">虚拟机内的应用无需单独配置代理。</p><p id="switch-note" hidden></p><p id="problem" role="status"></p></div><button type="submit" id="start" class="primary">启用代理</button></div></form>
-</details></div></main>
+</details>
+</div></main>
 <footer class="log-footer"><details id="activity">
 <summary>活动日志</summary>
 <div class="log-tools"><span id="log-note" role="status"></span><button type="button" id="log-copy">复制日志</button><button type="button" id="log-clear">清空</button></div>
 <div id="log-lines" tabindex="0" aria-label="最近的活动日志"></div>
 </details></footer>
+<dialog id="capture-dialog" class="app-dialog" aria-labelledby="capture-title">
+<h2 id="capture-title">解密与录制设置</h2>
+<section class="capture-setting">
+<h3>宿主机 CA</h3><p>同一宿主机上的虚拟机共用这张证书。将它导入客户机或模板的受信任根证书后，即可解密 TLS 流量。</p>
+<button id="export-ca" type="button">导出宿主机 CA</button>
+<p class="path" id="capture-result" role="status"></p>
+</section>
+<section class="capture-setting">
+<h3>录制存储目录</h3><p id="capture-target"></p>
+<p class="path" id="capture-directory" role="status"></p>
+<p id="capture-location-help" hidden>更改位置从下次录制生效，已有文件可在原位置查看。</p>
+<div class="recording-actions"><button id="open-recordings" type="button">打开录制目录</button><button id="choose-recordings" type="button">更改位置…</button><button id="reset-recordings" type="button" hidden>恢复默认位置</button></div>
+<button id="legacy-recordings" type="button" hidden>打开旧版录制目录</button>
+<p id="capture-storage-status" role="status"></p>
+</section>
+<form method="dialog" class="guide-actions"><button>关闭</button></form>
+</dialog>
+<dialog id="upgrade-ca" class="app-dialog" aria-labelledby="upgrade-ca-title">
+<h2 id="upgrade-ca-title">升级宿主机 CA</h2>
+<p>旧证书无法签署 Windows 需要的吊销列表。升级后，请将新导出的证书导入客户机或沙箱模板，再启用 TLS 解密。</p>
+<form method="dialog" class="guide-actions"><button value="cancel" autofocus>取消</button><button value="upgrade" class="primary">升级并导出新证书</button></form>
+</dialog>
+<dialog id="connections-dialog" class="app-dialog" aria-labelledby="connections-title">
+<div class="connections-head"><div><h2 id="connections-title">上游 TCP 连接</h2><p id="connections-machine" class="path"></p></div><form method="dialog"><button>关闭</button></form></div>
+<p id="connections-count"></p>
+<div class="connections-filters"><label>搜索地址或端口<input id="connections-query" type="search" placeholder="目的地址、客户机或本地端口" autocomplete="off"></label>
+<label>连接类型<select id="connections-kind"><option value="">全部类型</option><option>TCP</option><option>DNS TCP</option><option>UDP 控制</option><option>DNS UDP 控制</option><option>上游握手</option></select></label>
+<button type="button" id="connections-refresh">刷新</button></div>
+<div class="connections-scroll" tabindex="0" aria-label="活动连接列表"><table><thead><tr><th>类型</th><th>客户机来源</th><th>宿主机本地端点</th><th>目的地址</th><th>建立时间</th><th>操作</th></tr></thead><tbody id="connections-body"></tbody></table></div>
+<p id="connections-status" class="quiet" role="status"></p>
+<div class="connections-actions"><button type="button" id="connections-all">断开全部连接…</button><div><button type="button" id="connections-prev">上一页</button> <button type="button" id="connections-next">下一页</button></div></div>
+</dialog>
+<dialog id="route-dialog" class="app-dialog" aria-labelledby="route-title">
+<h2 id="route-title"></h2><p id="route-machine" class="path"></p>
+<form id="route-form"><div id="route-fields">
+<label for="switch-address">新上游代理</label><div class="proxy-editor"><input id="switch-address" autocomplete="off" spellcheck="false"><button id="switch-eye" type="button" hidden aria-controls="switch-address" aria-pressed="false" aria-label="显示代理密钥" title="显示代理密钥"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/><path class="eye-slash" d="m3 3 18 18"/></svg></button></div>
+<label class="host-policy"><input id="switch-verify" type="checkbox" checked>切换前核对新出口 IP</label>
+</div><p id="route-impact"></p><p id="route-error" role="status"></p>
+<div class="guide-actions"><button type="button" id="route-cancel">取消</button><button class="primary" id="route-apply" type="submit"></button></div></form></dialog>
 <dialog id="exit-dialog" class="app-dialog" aria-labelledby="exit-title" aria-describedby="exit-machine exit-path">
   <h2 id="exit-title">确认出口 IP</h2>
   <p id="exit-machine"></p><p id="exit-path" class="path"></p>
   <div class="exit-result"><strong id="exit-ip"></strong><span id="exit-location"></span></div>
-  <dl class="exit-details"><dt>上游 SOCKS5</dt><dd id="exit-server"></dd><dt>查询来源</dt><dd id="exit-source"></dd></dl>
+  <dl class="exit-details"><dt>上游代理</dt><dd id="exit-server"></dd><dt>查询来源</dt><dd id="exit-source"></dd></dl>
   <p id="exit-error" role="alert"></p>
   <div class="exit-actions"><button type="button" id="exit-cancel" autofocus>取消</button><button type="button" id="exit-approve" class="primary">确认并启用代理</button></div>
 </dialog>
@@ -84,7 +145,9 @@ GuestGate 会继续自动检测。</p>
 <div><span>↑ 上行速度</span><strong class="up-rate"></strong><small class="up-total"></small></div>
 <div><span>↓ 下行速度</span><strong class="down-rate"></strong><small class="down-total"></small></div>
 </div>
-<div class="upstream-head"><strong>上游 SOCKS5</strong><span class="server-address"></span><button type="button" class="probe-upstream">探测上游代理</button></div>
+<div class="upstream-head"><strong>上游代理</strong><span class="server-address"></span><button type="button" class="probe-upstream">探测上游代理</button>
+<div class="upstream-actions"><button type="button" class="switch-upstream">切换上游…</button><button type="button" class="open-connections" aria-haspopup="dialog" aria-controls="connections-dialog">查看上游连接…</button></div></div>
+<p class="live-note quiet" role="status"></p>
 <dl class="health-list">
 <div data-check="Service"><dt>服务状态</dt><dd><b></b><small></small></dd></div>
 <div data-check="TCP"><dt>TCP 代理</dt><dd><b></b><small></small></dd></div>
@@ -92,10 +155,15 @@ GuestGate 会继续自动检测。</p>
 </dl>
 <p class="check-note" role="status"></p><p class="dial-error"></p>
 </section>
+<div class="session-tools recording-tools" hidden>
+<button type="button" class="record-toggle">开始录制流量并解密 TLS</button>
+<span class="recording-status" hidden><span class="recording-label"></span> · <button type="button" class="recording-folder">打开目录</button></span>
+<span class="recording-error" role="status"></span><span class="recording-feedback" role="status"></span>
+</div>
 <details class="setup"><summary></summary><ol></ol></details><p class="session-error" role="status"></p></article></template>
 <template id="setup-step"><li>
   <span class="step-no"></span><span class="step-title"></span>
   <span class="step-state" role="img"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path/></svg></span>
   <span class="step-detail"></span>
 </li></template>
-<script src="app.js"></script><script src="activity.js"></script><script src="exit-confirmation.js"></script></body></html>
+<script src="proxy-address.js"></script><script src="session-controls.js"></script><script src="app.js"></script><script src="activity.js"></script><script src="exit-confirmation.js"></script></body></html>

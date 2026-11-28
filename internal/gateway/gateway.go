@@ -10,65 +10,204 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/xjasonlyu/tun2socks/v2/core"
 	"github.com/xjasonlyu/tun2socks/v2/core/adapter"
 	"github.com/xjasonlyu/tun2socks/v2/metadata"
-	"github.com/xjasonlyu/tun2socks/v2/proxy/socks5"
 	"github.com/xjasonlyu/tun2socks/v2/tunnel"
 	"github.com/xjasonlyu/tun2socks/v2/tunnel/statistic"
-	xproxy "golang.org/x/net/proxy"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 
+	"guestgate/internal/capture"
 	"guestgate/internal/dnsrelay"
+	"guestgate/internal/upstream"
 	"guestgate/internal/vmnet"
 )
 
 const proxyTCPTimeout = 26 * time.Second
 
 type gatewayHandler struct {
-	activity *activityBatch
-	isolated bool
+	stack       *stack.Stack
+	gateway     *gateway
+	crlSlots    chan struct{}
+	serveCRL    func(net.Conn)
+	flows       sync.WaitGroup
+	flowMu      sync.Mutex
+	closing     bool
+	intercepted int
+	drainingCA  *capture.Recorder
+	activity    *activityBatch
+	isolated    bool
 	*tunnel.DeferredTCPHandler
 
-	lastTCPError atomic.Pointer[string]
-	dialer       xproxy.ContextDialer
-	dns          *dnsrelay.Relay
-	ctx          context.Context
+	localTCPError atomic.Pointer[string]
+	dialer        *upstream.Client
+	dns           *dnsrelay.Relay
+	ctx           context.Context
+}
+
+// Identifies a virtual HTTP connection so its bytes bypass TLS capture.
+type crlConnection struct{ net.Conn }
+
+func (h *gatewayHandler) isGateway(raw []byte) bool {
+	ip, ok := netip.AddrFromSlice(raw)
+	return ok && h.gateway != nil && h.gateway.ip == ip.Unmap()
+}
+
+func (h *gatewayHandler) dialCRL(serve func(net.Conn)) (net.Conn, error) {
+	select {
+	case h.crlSlots <- struct{}{}:
+	default:
+		return nil, errors.New("网关 CRL 请求过多")
+	}
+	client, server := net.Pipe()
+	if !h.launch(func() {
+		defer func() { <-h.crlSlots }()
+		stop := context.AfterFunc(h.ctx, func() { server.Close() })
+		defer stop()
+		serve(server)
+	}) {
+		<-h.crlSlots
+		client.Close()
+		server.Close()
+		return nil, net.ErrClosed
+	}
+	return crlConnection{client}, nil
 }
 
 func (h *gatewayHandler) DialTCP(ctx context.Context, id stack.TransportEndpointID) (net.Conn, error) {
 	// The deferred forwarder creates the guest endpoint only after this returns.
-	// Read and validate the entire SOCKS5 CONNECT reply, including BND.ADDR and port.
+	// Both SOCKS5 and HTTP dialers wait for the upstream CONNECT reply.
 	destination := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+	if h.isGateway(id.LocalAddress.AsSlice()) {
+		if id.LocalPort == 80 {
+			if r := h.crlRecorder(); r != nil {
+				return h.dialCRL(func(c net.Conn) {
+					if r.ServeCRL(c) {
+						h.activity.add("PKI", "已向客户机返回宿主机 CA 的签名吊销列表")
+					}
+				})
+			}
+			if h.serveCRL != nil {
+				return h.dialCRL(h.serveCRL)
+			}
+		}
+		return nil, errors.New("虚拟网关未开放此端口")
+	}
 	if h.isolated && hostDestination(id.LocalAddress.AsSlice()) {
 		h.activity.add("阻断", "TCP "+destination+" · 隔离策略")
-		return nil, errors.New("隔离策略阻断宿主机地址")
+		err := errors.New("隔离策略阻断宿主机地址")
+		h.gateway.recording().Failed(destination, false, err)
+		return nil, err
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, proxyTCPTimeout)
 	defer cancel()
 	h.activity.add("TCP", destination+" · 请求连接")
-	conn, err := h.dialer.DialContext(dialCtx, "tcp", destination)
+	source := net.JoinHostPort(id.RemoteAddress.String(), strconv.Itoa(int(id.RemotePort)))
+	conn, err := h.dialer.DialGuestTCP(dialCtx, destination, source)
 	if err != nil {
 		detail := destination + " · " + err.Error()
 		h.activity.add("错误", "TCP "+detail)
-		h.lastTCPError.Store(&detail)
+		if problem := localTCPDialProblem(err); problem != "" {
+			h.localTCPError.Store(&problem)
+		}
+		h.gateway.recording().Failed(destination, false, err)
 	} else {
-		h.activity.add("TCP", destination+" · SOCKS5 已连接")
-		h.lastTCPError.Store(nil)
+		h.activity.add("TCP", destination+" · 上游代理已连接")
+		h.localTCPError.Store(nil)
 	}
 	return conn, err
 }
 
+func (h *gatewayHandler) launch(f func()) bool {
+	h.flowMu.Lock()
+	defer h.flowMu.Unlock()
+	if h.closing {
+		return false
+	}
+	h.flows.Go(f)
+	return true
+}
+func (h *gatewayHandler) stopFlows() {
+	h.flowMu.Lock()
+	h.closing = true
+	h.flowMu.Unlock()
+	h.flows.Wait()
+}
+
+// A TLS handshake already in flight may still need its issuer's CRL after
+// recording stops. Keep that endpoint available until the captured flows drain.
+func (h *gatewayHandler) crlRecorder() *capture.Recorder {
+	h.flowMu.Lock()
+	defer h.flowMu.Unlock()
+	if r := h.gateway.recording(); r != nil {
+		return r
+	}
+	return h.drainingCA
+}
+
+func (h *gatewayHandler) HandleTCPConnected(guest adapter.TCPConn, remote net.Conn) {
+	if tracked, ok := remote.(*upstream.GuestTCP); ok {
+		// Resolve the endpoint at handoff; later tuple reuse must never reset a different flow.
+		if ep, ok := h.stack.FindTransportEndpoint(header.IPv4ProtocolNumber, tcp.ProtocolNumber, guest.ID(), 0).(*tcp.Endpoint); ok {
+			tracked.BindAbort(ep.Abort)
+		}
+		remote = tracked.Conn
+	}
+	if _, local := remote.(crlConnection); local {
+		h.DeferredTCPHandler.HandleTCPConnected(guest, remote)
+		return
+	}
+	h.flowMu.Lock()
+	recorder := h.gateway.recording()
+	if recorder != nil {
+		h.intercepted++
+		h.drainingCA = recorder
+	}
+	h.flowMu.Unlock()
+	if recorder == nil {
+		h.DeferredTCPHandler.HandleTCPConnected(guest, remote)
+		return
+	}
+	release := func() {
+		h.flowMu.Lock()
+		h.intercepted--
+		if h.intercepted == 0 {
+			h.drainingCA = nil
+		}
+		h.flowMu.Unlock()
+	}
+	id := guest.ID()
+	dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+	if !h.launch(func() {
+		defer release()
+		if err := recorder.Relay(h.ctx, guest, remote, dst, "http://"+h.gateway.ip.String()+recorder.CRLPath()); err != nil && h.ctx.Err() == nil {
+			h.activity.add("录制", dst+" · "+err.Error())
+		}
+	}) {
+		release()
+		guest.Close()
+		remote.Close()
+	}
+}
+
 func (h *gatewayHandler) HandleUDP(c adapter.UDPConn) {
 	id := c.ID()
+	if h.isGateway(id.LocalAddress.AsSlice()) {
+		c.Close()
+		return
+	}
 	if h.isolated && hostDestination(id.LocalAddress.AsSlice()) {
-		h.activity.add("阻断", "UDP "+net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))+" · 隔离策略")
+		dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+		h.activity.add("阻断", "UDP "+dst+" · 隔离策略")
+		h.gateway.recording().Failed(dst, true, errors.New("隔离策略阻断宿主机地址"))
 		c.Close()
 		return
 	}
@@ -76,7 +215,9 @@ func (h *gatewayHandler) HandleUDP(c adapter.UDPConn) {
 		h.DeferredTCPHandler.HandleUDP(c)
 		return
 	}
-	go h.serveDNS(c)
+	if !h.launch(func() { h.serveDNS(c) }) {
+		c.Close()
+	}
 }
 func (h *gatewayHandler) serveDNS(c adapter.UDPConn) {
 	defer c.Close()
@@ -88,6 +229,9 @@ func (h *gatewayHandler) serveDNS(c adapter.UDPConn) {
 		return
 	}
 	target := netip.AddrPortFrom(dest.Unmap(), id.LocalPort)
+	var tap *capture.Tap
+	var recording *capture.Recorder
+	defer func() { tap.Close("") }()
 	msg := make([]byte, 65535)
 	for {
 		c.SetReadDeadline(time.Now().Add(20 * time.Second))
@@ -98,12 +242,20 @@ func (h *gatewayHandler) serveDNS(c adapter.UDPConn) {
 		ctx, cancel := context.WithTimeout(h.ctx, proxyTCPTimeout)
 		query := dnsQuestion(msg[:n]) + " → " + target.String()
 		h.activity.add("DNS", query)
+		if current := h.gateway.recording(); current != recording {
+			tap.Close("")
+			recording = current
+			tap = current.Open(target.String(), "", "", false, true)
+		}
+		tap.Data(0, msg[:n])
 		reply, err := h.dns.Exchange(ctx, target, msg[:n])
 		cancel()
 		if err != nil {
 			h.activity.add("错误", "DNS "+query+" · "+err.Error())
+			tap.Note("DNS 转发失败：" + err.Error())
 			continue
 		}
+		tap.Data(1, reply)
 		if _, err = c.WriteTo(reply, from); err != nil {
 			return
 		}
@@ -111,6 +263,7 @@ func (h *gatewayHandler) serveDNS(c adapter.UDPConn) {
 }
 
 type gateway struct {
+	capture            *atomic.Pointer[capture.Recorder]
 	activity           *activityBatch
 	isolated           bool
 	addresses          gatewayAddresses
@@ -120,6 +273,13 @@ type gateway struct {
 	link               *channel.Endpoint
 	upBytes, downBytes atomic.Uint64
 	answeredARP        atomic.Bool
+}
+
+func (g *gateway) recording() *capture.Recorder {
+	if g == nil || g.capture == nil {
+		return nil
+	}
+	return g.capture.Load()
 }
 
 func (g *gateway) ethernet(data []byte, protocol uint16) error {
@@ -147,7 +307,7 @@ func (g *gateway) accept(frame []byte) error {
 		}
 		g.answeredARP.Store(true)
 	case 0x0800:
-		if !bytes.Equal(frame[:6], g.mac) || len(frame) < 34 {
+		if g.link == nil || !bytes.Equal(frame[:6], g.mac) || len(frame) < 34 {
 			return nil
 		}
 		// SOCKS5 carries TCP and UDP. Do not synthesize Internet ping replies.
@@ -166,22 +326,29 @@ func (g *gateway) accept(frame []byte) error {
 	return nil
 }
 func (g *gateway) transmit(ctx context.Context) error {
+	return g.transmitLink(ctx, g.link)
+}
+func (g *gateway) transmitLink(ctx context.Context, link *channel.Endpoint) error {
 	for {
-		pkt := g.link.ReadContext(ctx)
+		pkt := link.ReadContext(ctx)
 		if pkt == nil {
 			return nil
 		}
-		b := pkt.ToBuffer()
-		data := b.Flatten()
-		size := len(data)
-		e := g.ethernet(data, 0x0800)
-		b.Release()
-		pkt.DecRef()
-		if e != nil {
-			return e
+		if err := g.sendPacket(pkt); err != nil {
+			return err
 		}
-		g.downBytes.Add(uint64(size))
 	}
+}
+func (g *gateway) sendPacket(pkt *stack.PacketBuffer) error {
+	defer pkt.DecRef()
+	b := pkt.ToBuffer()
+	defer b.Release()
+	data := b.Flatten()
+	if err := g.ethernet(data, 0x0800); err != nil {
+		return err
+	}
+	g.downBytes.Add(uint64(len(data)))
+	return nil
 }
 
 // Probe the proposed gateway before advertising it in DHCP. A live peer
@@ -267,40 +434,39 @@ func (g *gateway) status(lease netip.Addr, linkErr error) string {
 }
 
 type activityProxy struct {
-	*socks5.Socks5
+	gateway  *gateway
+	client   *upstream.Client
+	ctx      context.Context
 	activity *activityBatch
+}
+
+func (p activityProxy) DialContext(ctx context.Context, m *metadata.Metadata) (net.Conn, error) {
+	return p.client.DialContext(ctx, "tcp", m.DestinationAddress())
 }
 
 func (p activityProxy) DialUDP(m *metadata.Metadata) (net.PacketConn, error) {
 	dst := m.DestinationAddress()
 	p.activity.add("UDP", dst+" · 请求转发")
-	conn, err := p.Socks5.DialUDP(m)
+	conn, err := p.client.DialPacket(upstream.WithPurpose(p.ctx, upstream.UDPControl, dst))
 	if err != nil {
 		p.activity.add("错误", "UDP "+dst+" · "+err.Error())
+		p.gateway.recording().Failed(dst, true, err)
+		return nil, err
 	}
-	return conn, err
+	return p.gateway.recording().Open(dst, "", "", false, true).Packet(conn), nil
 }
 
-func (g *gateway) startStack(ctx context.Context, server, user, password string) (*gatewayHandler, func(), error) {
-	upstream, e := socks5.New(server, user, password)
-	if e != nil {
-		return nil, nil, e
-	}
-	var auth *xproxy.Auth
-	if user != "" {
-		auth = &xproxy.Auth{User: user, Password: password}
-	}
-	tcpDialer, e := xproxy.SOCKS5("tcp", server, auth, &net.Dialer{Timeout: 6 * time.Second})
-	if e != nil {
-		return nil, nil, e
-	}
+func (g *gateway) startStack(ctx context.Context, client *upstream.Client) (*gatewayHandler, func(), error) {
+	return g.stackOn(ctx, client, g.link)
+}
+func (g *gateway) stackOn(ctx context.Context, client *upstream.Client, link *channel.Endpoint) (*gatewayHandler, func(), error) {
 	child, cancel := context.WithCancel(ctx)
-	t := tunnel.New(activityProxy{upstream, g.activity}, statistic.DefaultManager)
+	t := tunnel.New(activityProxy{g, client, child, g.activity}, statistic.DefaultManager)
 	t.ProcessAsync()
 
-	h := &gatewayHandler{activity: g.activity, isolated: g.isolated, DeferredTCPHandler: tunnel.NewDeferredTCPHandler(child, t), dialer: tcpDialer.(xproxy.ContextDialer), ctx: child}
-	h.dns = dnsrelay.New(child, server, auth, h.dialer)
-	s, e := core.CreateStack(&core.Config{LinkEndpoint: g.link, TransportHandler: h, RejectIPv6: true, DeferredTCP: &core.DeferredTCPConfig{Context: child}})
+	h := &gatewayHandler{gateway: g, crlSlots: make(chan struct{}, 32), activity: g.activity, isolated: g.isolated, DeferredTCPHandler: tunnel.NewDeferredTCPHandler(child, t), dialer: client, ctx: child}
+	h.dns = dnsrelay.New(child, client)
+	s, e := core.CreateStack(&core.Config{LinkEndpoint: link, TransportHandler: h, RejectIPv6: true, DeferredTCP: &core.DeferredTCPConfig{Context: child}})
 	if e != nil {
 		cancel()
 		<-h.dns.Done()
@@ -308,18 +474,20 @@ func (g *gateway) startStack(ctx context.Context, server, user, password string)
 		t.Close()
 		return nil, nil, e
 	}
+	h.stack = s
 	return h, func() {
 		cancel()
 		<-h.dns.Done()
 		h.Close()
 		s.Close()
 		s.Wait()
+		h.stopFlows()
 		t.Close()
-		g.link.Close()
+		link.Close()
 	}, nil
 }
 
-func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, password string, p *setupProgress, probe <-chan struct{}) (result error) {
+func (m *manager) gatewayRun(ctx context.Context, v VM, dev string, client *upstream.Client, active *atomic.Pointer[capture.Recorder], p *setupProgress, session sessionControl) (result error) {
 	// Detach and shut down this guest's stack before waiting for vmrun or
 	// restarting DHCP. Existing VMnet peers retain their own data paths.
 	var reconnected chan error
@@ -344,14 +512,15 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 	if e != nil {
 		return e
 	}
-	g := gateway{activity: p.activity, isolated: v.isolated, guest: guest, addresses: v.scope, link: channel.New(512, 1500, "")}
+	g := gateway{capture: active, activity: p.activity, isolated: v.isolated, guest: guest, addresses: v.scope}
 	child, cancel := context.WithCancel(ctx)
 	defer cancel()
-	h, closeStack, e := g.startStack(child, server, user, password)
+	route, e := g.newForwarding(child, client)
 	if e != nil {
 		return e
 	}
-	defer func() { p.cleaning("正在关闭代理连接和协议栈"); closeStack() }()
+	g.link = route.link
+	defer func() { p.cleaning("正在关闭代理连接和协议栈"); route.close() }()
 	drivers := []frameBackend{{"VMware 驱动", func() (vmnet.Port, error) { return vmnet.Open(v.Network) }}}
 	if !v.isolated {
 		drivers = append(drivers, frameBackend{"Npcap 回退", func() (vmnet.Port, error) { return vmnet.OpenNpcap(dev) }})
@@ -372,17 +541,16 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 	dhcpInstalled = true
 	p.step(setDHCP, "done", "网关 "+g.ip.String()+" · DNS "+v.dns.String())
 	p.step(confirmGuest, "active", "正在重连虚拟网卡，等待本次租约或首个 TCP/UDP 包")
-	results := make(chan error, 1)
-	go func() { results <- g.transmit(child) }()
+	route.transmit(&g)
 	waitingSince := time.Now()
 	var lease netip.Addr
-	p.state.Stats.Server, p.state.Stats.DNS = server, v.dns.String()
+	p.state.Stats.Server, p.state.Stats.DNS = client.Display(), v.dns.String()
 	sample := trafficSample{at: since}
 	var probeResult chan dnsrelay.Health
 	startProbe := func() {
 		probeResult = make(chan dnsrelay.Health, 1)
 		p.state.Stats.Probing = true
-		go func(out chan<- dnsrelay.Health) { out <- h.dns.Check(child, v.dns) }(probeResult)
+		go func(f *forwarding, out chan<- dnsrelay.Health) { out <- f.handler.dns.Check(f.ctx, v.dns) }(route, probeResult)
 	}
 	defer func() {
 		if probeResult != nil {
@@ -411,11 +579,69 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 		select {
 		case err := <-guardFailure:
 			cancel()
-			<-results
+			<-route.sent
 			return err
 		case <-p.activity.flush:
 			p.report(p.state)
-		case <-probe:
+		case cmd := <-session.commands:
+			var res ControlResult
+			if child.Err() != nil || p.state.Phase != "ready" {
+				res.Error = "会话尚未就绪或已停止"
+			} else {
+				switch cmd.Action {
+				case "connections":
+					page := route.sockets.Page(cmd.Offset, cmd.Query, cmd.Kind)
+					res.Page = &page
+				case "disconnect-one":
+					if err := route.sockets.Disconnect(cmd.ConnectionID); err != nil {
+						res.Error = err.Error()
+					}
+				case "record":
+					err := g.setRecording(v.Path, cmd.RecordingRoot, cmd.RecordTraffic, p)
+					if err != nil {
+						res.Error = err.Error()
+						p.activity.add("错误", res.Error)
+					}
+				case "disconnect", "switch":
+					var c *upstream.Client
+					var err error
+					if cmd.Action == "switch" {
+						c, err = upstream.Parse(cmd.Proxy)
+					} else {
+						c, err = route.client.FreshTransport()
+					}
+					if err != nil {
+						res.Error = err.Error()
+						break
+					}
+					next, err := g.newForwarding(child, c)
+					if err != nil {
+						res.Error = err.Error()
+						break
+					}
+					if err := g.switchForwarding(route, next); err != nil {
+						next.close()
+						cmd.reply(ControlResult{Error: err.Error()})
+						return err
+					}
+					route = next
+					if probeResult != nil {
+						<-probeResult
+						probeResult = nil
+					}
+					p.state.Stats.Server = c.Display()
+					p.state.Stats.LocalTCPError = ""
+					p.state.Stats.Health = dnsrelay.Health{}
+					p.activity.add("上游", "已断开本虚拟机的原有连接，新连接使用 "+c.Display())
+					startProbe()
+				}
+			}
+			if cmd.Action != "connections" {
+				p.state.Stats.TCPConnections, p.state.Stats.UDPControls = route.sockets.Counts()
+				p.report(p.state)
+			}
+			cmd.reply(res)
+		case <-session.probe:
 			if probeResult != nil || p.state.Phase != "ready" || child.Err() != nil {
 				continue
 			}
@@ -429,7 +655,7 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 				name   string
 				result dnsrelay.CheckResult
 			}{
-				{"SOCKS5 服务", health.Service},
+				{"上游代理服务", health.Service},
 				{"TCP 转发探测", health.TCP},
 				{"UDP 转发探测", health.UDP},
 			} {
@@ -438,11 +664,11 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 				}
 			}
 			p.report(p.state)
-		case err := <-results:
+		case err := <-route.sent:
 			return err
 		case <-hub.done:
 			cancel()
-			<-results
+			<-route.sent
 			return hub.err
 		case linkErr = <-linkResult:
 			if linkErr != nil {
@@ -452,6 +678,15 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 			reconnected = nil // The reconnect command has returned; no wait during shutdown.
 		case now := <-ticker.C:
 			before := p.state
+			p.state.Stats.TCPConnections, p.state.Stats.UDPControls = route.sockets.Counts()
+			if recorder := active.Load(); recorder != nil && p.state.RecordingError == "" {
+				if e := recorder.Status(); e != nil {
+					active.Swap(nil).Close()
+					p.state.Recording = false
+					p.state.RecordingError = e.Error()
+					p.activity.add("错误", e.Error())
+				}
+			}
 			up := g.upBytes.Load()
 			if up == 0 && !now.Before(nextLeaseRead) {
 				if observed := currentLease(v, since, now); observed.IsValid() {
@@ -460,9 +695,9 @@ func (m *manager) gatewayRun(ctx context.Context, v VM, dev, server, user, passw
 				nextLeaseRead = now.Add(3 * time.Second)
 			}
 			p.state.Stats.sample(&sample, now, up, g.downBytes.Load())
-			p.state.Stats.LastTCPError = ""
-			if detail := h.lastTCPError.Load(); detail != nil {
-				p.state.Stats.LastTCPError = *detail
+			p.state.Stats.LocalTCPError = ""
+			if detail := route.handler.localTCPError.Load(); detail != nil {
+				p.state.Stats.LocalTCPError = *detail
 			}
 			if p.state.Phase == "starting" && child.Err() == nil && (lease.IsValid() || up > 0) {
 				evidence := "已收到虚拟机 TCP/UDP 流量"

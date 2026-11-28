@@ -14,9 +14,13 @@ import (
 
 	"guestgate/internal/gateway"
 	"guestgate/internal/profiles"
+	"guestgate/internal/upstream"
 )
 
 type App struct {
+	nextRequest  uint64
+	replies      map[uint64]chan gateway.ControlResult
+	windowCtx    context.Context
 	checking     map[string]context.CancelFunc
 	exitRequests []*exitRequest
 	exitChanged  func()
@@ -82,6 +86,14 @@ func (a *App) startManager() error {
 				continue
 			}
 			a.mu.Lock()
+			if event.Reply != nil {
+				if reply := a.replies[event.RequestID]; reply != nil {
+					reply <- *event.Reply
+					delete(a.replies, event.RequestID)
+				}
+				a.mu.Unlock()
+				continue
+			}
 			key := strings.ToLower(event.VM)
 			a.activity.append(event.VM, event.Activity...)
 			if !event.State.Running {
@@ -129,7 +141,7 @@ func (a *App) StartVMWithHostAccess(vm, proxy, dns, restPassword string, allowHo
 			a.activity.record(vm, "错误", "启用代理 · "+result.Error())
 		}
 	}()
-	server, _, _, err := gateway.ParseProxy(proxy)
+	client, err := upstream.Parse(proxy)
 	if err != nil {
 		return err
 	}
@@ -170,7 +182,7 @@ func (a *App) StartVMWithHostAccess(vm, proxy, dns, restPassword string, allowHo
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		ok, err := a.awaitExit(ctx, vm, server, info)
+		ok, err := a.awaitExit(ctx, vm, client.Display(), info)
 		if err != nil {
 			return err
 		}
@@ -192,6 +204,10 @@ func (a *App) StartVMWithHostAccess(vm, proxy, dns, restPassword string, allowHo
 		return err
 	}
 	cfg := gateway.Config{VM: vm, Proxy: proxy, DNS: ip.String(), RESTPassword: restPassword, AllowHostAccess: allowHostAccess}
+	if pref != nil {
+		cfg.RecordTraffic = pref.RecordTraffic
+		cfg.RecordingRoot = pref.RecordingRoot
+	}
 	if err = json.NewEncoder(a.pipe).Encode(gateway.WorkerCommand{Action: "start", Config: cfg}); err != nil {
 		return err
 	}

@@ -17,7 +17,9 @@
       currentID = prompt.ID;
       const vm = machines.get(prompt.VM.toLowerCase())?.vm;
       setText(el("exit-machine"), vm?.Name || prompt.VM.split(/[\\/]/).pop());
-      setText(el("exit-path"), prompt.VM);
+      setText(el("exit-path"), displayPath(prompt.VM));
+      setText(el("exit-title"), prompt.Switching ? "确认新上游的出口 IP" : "确认出口 IP");
+      setText(approve, prompt.Switching ? "确认断开旧连接并切换" : "确认并启用代理");
       setText(el("exit-ip"), prompt.IP);
       setText(el("exit-location"), prompt.Location);
       setText(el("exit-server"), prompt.Server);

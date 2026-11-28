@@ -9,18 +9,21 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
-	"guestgate/internal/gateway"
+
+	"guestgate/internal/upstream"
 )
 
 type exitInfo struct{ IP, Location, Source string }
 
-type ExitPrompt struct{ ID, VM, Server, IP, Location, Source string }
+type ExitPrompt struct {
+	ID, VM, Server, IP, Location, Source string
+	Switching                            bool
+}
 
 type exitRequest struct {
 	prompt ExitPrompt
@@ -30,6 +33,7 @@ type exitRequest struct {
 func AttachWindow(a *App, ctx context.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.windowCtx = ctx
 	a.exitChanged = func() { runtime.EventsEmit(ctx, "guestgate:exit-confirmation") }
 }
 
@@ -56,8 +60,11 @@ func (a *App) AnswerExitConfirmation(id string, approved bool) {
 }
 
 func (a *App) awaitExit(ctx context.Context, vm, server string, info exitInfo) (bool, error) {
+	return a.confirmExit(ctx, vm, server, info, false)
+}
+func (a *App) confirmExit(ctx context.Context, vm, server string, info exitInfo, switching bool) (bool, error) {
 	req := &exitRequest{
-		prompt: ExitPrompt{rand.Text(), vm, server, info.IP, info.Location, info.Source},
+		prompt: ExitPrompt{rand.Text(), vm, server, info.IP, info.Location, info.Source, switching},
 		answer: make(chan bool, 1),
 	}
 	a.mu.Lock()
@@ -85,16 +92,11 @@ func (a *App) awaitExit(ctx context.Context, vm, server string, info exitInfo) (
 }
 
 func lookupExit(ctx context.Context, raw string) (exitInfo, error) {
-	server, user, pass, err := gateway.ParseProxy(raw)
+	up, err := upstream.Parse(raw)
 	if err != nil {
 		return exitInfo{}, err
 	}
-	upstream := &url.URL{Scheme: "socks5h", Host: server}
-	if user != "" {
-		upstream.User = url.UserPassword(user, pass)
-	}
-	// Both HTTPS requests and destination DNS resolution go through this SOCKS5.
-	transport := &http.Transport{Proxy: http.ProxyURL(upstream), DisableKeepAlives: true}
+	transport := &http.Transport{DialContext: up.DialContext, DisableKeepAlives: true}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: 7 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return firstExit(ctx, client, []string{
@@ -129,7 +131,7 @@ func firstExit(ctx context.Context, client *http.Client, sources []string) (exit
 			failures = errors.Join(failures, res.err)
 		}
 	}
-	return exitInfo{}, fmt.Errorf("经 SOCKS5 查询出口 IP 和归属地失败：%w", failures)
+	return exitInfo{}, fmt.Errorf("经上游代理查询出口 IP 和归属地失败：%w", failures)
 }
 
 func readExit(ctx context.Context, client *http.Client, source string) (exitInfo, error) {

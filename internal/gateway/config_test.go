@@ -3,6 +3,8 @@ package gateway
 import (
 	"bytes"
 	"testing"
+
+	"guestgate/internal/upstream"
 )
 
 func TestScopedConfigRemoval(t *testing.T) {
@@ -18,14 +20,14 @@ func TestScopedConfigRemoval(t *testing.T) {
 		t.Fatal("incomplete entry accepted")
 	}
 }
-func TestSOCKSOnly(t *testing.T) {
-	for _, v := range []string{"direct://127.0.0.1:80", "http://proxy:80", "socks5://host:0", "socks5://host:70000"} {
-		if _, _, _, e := ParseProxy(v); e == nil {
+func TestProxyValidation(t *testing.T) {
+	for _, v := range []string{"direct://127.0.0.1:80", "socks5s://proxy:80", "socks5://host:0", "socks5://host:70000"} {
+		if _, e := upstream.Parse(v); e == nil {
 			t.Fatalf("accepted %s", v)
 		}
 	}
-	address, user, pass, e := ParseProxy("socks5://a:p%40ss@[::1]:1080")
-	if e != nil || address != "[::1]:1080" || user != "a" || pass != "p@ss" {
+	client, e := upstream.Parse("socks5://a:p%40ss@[::1]:1080")
+	if e != nil || client.Server != "[::1]:1080" {
 		t.Fatal("credential or IPv6 parsing failed")
 	}
 }

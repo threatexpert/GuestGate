@@ -9,9 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/proxy"
-
 	"guestgate/internal/dnsrelay"
+	"guestgate/internal/upstream"
 )
 
 // Exercise the service greeting and both paths through a local SOCKS server.
@@ -25,12 +24,12 @@ func TestSessionHealth(t *testing.T) {
 			if mode == "closed" {
 				l.Close()
 			}
-			d, err := proxy.SOCKS5("tcp", server, nil, proxy.Direct)
+			d, err := upstream.Parse(server)
 			if err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithCancel(t.Context())
-			r := dnsrelay.New(ctx, server, nil, d.(proxy.ContextDialer))
+			r := dnsrelay.New(ctx, d)
 			defer func() { cancel(); <-r.Done() }()
 			result := make(chan dnsrelay.Health, 1)
 			target := netip.MustParseAddr("192.0.2.53")

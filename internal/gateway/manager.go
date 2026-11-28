@@ -3,6 +3,7 @@ package gateway
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,13 +11,19 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/windows"
+
+	"guestgate/internal/capture"
+	"guestgate/internal/upstream"
 )
 
 type sessionControl struct {
-	cancel context.CancelFunc
-	probe  chan struct{}
+	cancel   context.CancelFunc
+	probe    chan struct{}
+	id       string
+	commands chan liveCommand
 }
 
 type manager struct {
@@ -30,13 +37,28 @@ type manager struct {
 }
 
 type WorkerCommand struct {
-	Action string
+	Action       string
+	RequestID    uint64
+	SessionID    string
+	Offset       int
+	Query, Kind  string
+	ConnectionID uint64
 	Config
 }
+type ControlResult struct {
+	Error string
+	Page  *upstream.ConnectionPage
+}
+type liveCommand struct {
+	WorkerCommand
+	reply func(ControlResult)
+}
 type WorkerEvent struct {
-	VM       string
-	State    VMState
-	Activity []ActivityEntry `json:",omitempty"`
+	RequestID uint64         `json:",omitempty"`
+	Reply     *ControlResult `json:",omitempty"`
+	VM        string
+	State     VMState
+	Activity  []ActivityEntry `json:",omitempty"`
 }
 
 func (m *manager) start(cfg Config, report func(VMState, []ActivityEntry)) {
@@ -70,17 +92,23 @@ func (m *manager) start(cfg Config, report func(VMState, []ActivityEntry)) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	probe := make(chan struct{}, 1)
-	m.sessions[key] = sessionControl{cancel: cancel, probe: probe}
+	session := sessionControl{cancel: cancel, probe: probe, id: rand.Text(), commands: make(chan liveCommand, 8)}
+	p.state.SessionID = session.id
+	m.sessions[key] = session
 	m.wg.Add(1)
 	m.mu.Unlock()
 	go func() {
 		defer m.wg.Done()
 		p.report(p.state)
-		err := m.run(ctx, cfg, p, probe)
+		err := m.run(ctx, cfg, p, session)
 		stopped := ctx.Err() != nil
 		cancel()
 		m.mu.Lock()
 		delete(m.sessions, key)
+		close(session.commands)
+		for cmd := range session.commands {
+			cmd.reply(ControlResult{Error: "代理会话已结束"})
+		}
 		if len(m.sessions) == 0 {
 			windows.CloseHandle(m.lock)
 			m.lock = 0
@@ -185,7 +213,7 @@ func (m *manager) prepare(ctx context.Context, cfg Config, p *setupProgress) (VM
 		}
 		p.step(checkVM, "done", v.Name+" · 已确认只配置 1 个网络适配器 · "+v.subnet.String())
 		if v.isolated {
-			p.step(selectNetwork, "active", "正在连接专用隔离网络 "+v.Network)
+			p.step(selectNetwork, "active", "正在将虚拟机网卡接入专用隔离网络（"+strings.Replace(v.Network, "vmnet", "VMnet", 1)+"）。")
 			if err = switchIsolated(ctx, v, cfg.RESTPassword); err != nil {
 				if strings.Contains(strings.ToLower(err.Error()), "not powered on") {
 					listing, listErr := v.vmCommand("list")
@@ -210,12 +238,11 @@ func (m *manager) prepare(ctx context.Context, cfg Config, p *setupProgress) (VM
 			p.step(selectNetwork, "done", "已接入隔离网络（"+strings.Replace(v.Network, "vmnet", "VMnet", 1)+"）。虚拟机无法访问宿主机端口，上网必须通过代理。")
 			p.state.IsolatedNetwork = v.Network
 		} else if v.NeedsSwitch {
-			transition := v.CurrentNetwork + " → 共享仅主机网络（VMnet1）"
-			p.step(selectNetwork, "active", transition)
+			p.step(selectNetwork, "active", "正在将虚拟机网卡切换到共享仅主机网络（VMnet1）。")
 			if err = switchHostOnly(ctx, v, cfg.RESTPassword); err != nil {
 				return v, "", fmt.Errorf("未确认切换，原网络仍可能生效: %w", err)
 			}
-			p.step(selectNetwork, "done", transition+"，已核实网卡切换")
+			p.step(selectNetwork, "done", "已确认虚拟机网卡接入共享仅主机网络（VMnet1）。")
 		} else {
 			p.step(selectNetwork, "skipped", "已连接共享仅主机网络 "+v.Network+"，无需切换")
 		}
@@ -226,10 +253,31 @@ func (m *manager) prepare(ctx context.Context, cfg Config, p *setupProgress) (VM
 	}
 	return VM{}, "", errors.New("找不到运行中的虚拟机")
 }
-func (m *manager) run(ctx context.Context, cfg Config, p *setupProgress, probe <-chan struct{}) error {
-	server, user, pass, err := ParseProxy(cfg.Proxy)
+func (m *manager) run(ctx context.Context, cfg Config, p *setupProgress, session sessionControl) (result error) {
+	client, err := upstream.Parse(cfg.Proxy)
 	if err != nil {
 		return err
+	}
+	var active atomic.Pointer[capture.Recorder]
+	defer func() {
+		if r := active.Swap(nil); r != nil {
+			p.cleaning("正在写入录制索引")
+			if err := r.Close(); err != nil {
+				p.state.RecordingError = err.Error()
+				p.cleanupErr = errors.Join(p.cleanupErr, err)
+				result = errors.Join(result, err)
+			}
+		}
+	}()
+	if cfg.RecordTraffic {
+		recorder, err := capture.Start(cfg.VM, cfg.RecordingRoot)
+		if err != nil {
+			return err
+		}
+		p.state.RecordingDirectory = recorder.Directory
+		p.activity.add("录制", "录制目录 · "+recorder.Directory)
+		active.Store(recorder)
+		p.state.Recording = true
 	}
 	v, dev, err := m.prepare(ctx, cfg, p)
 	if v.controlShell != 0 {
@@ -238,7 +286,7 @@ func (m *manager) run(ctx context.Context, cfg Config, p *setupProgress, probe <
 	if err != nil {
 		return err
 	}
-	return m.gatewayRun(ctx, v, dev, server, user, pass, p, probe)
+	return m.gatewayRun(ctx, v, dev, client, &active, p, session)
 }
 
 func ServeManager(in io.Reader, out io.Writer) error {
@@ -258,8 +306,27 @@ func ServeManager(in io.Reader, out io.Writer) error {
 			m.start(cmd.Config, func(s VMState, activity []ActivityEntry) {
 				output.Lock()
 				defer output.Unlock()
-				_ = enc.Encode(WorkerEvent{vm, s, activity})
+				_ = enc.Encode(WorkerEvent{VM: vm, State: s, Activity: activity})
 			})
+		case "connections", "disconnect-one", "disconnect", "switch", "record":
+			command := cmd
+			reply := func(res ControlResult) {
+				output.Lock()
+				defer output.Unlock()
+				_ = enc.Encode(WorkerEvent{VM: command.VM, RequestID: command.RequestID, Reply: &res})
+			}
+			m.mu.Lock()
+			session, ok := m.sessions[strings.ToLower(cmd.VM)]
+			if !ok || session.id != cmd.SessionID {
+				reply(ControlResult{Error: "原代理会话已结束"})
+			} else {
+				select {
+				case session.commands <- liveCommand{cmd, reply}:
+				default:
+					reply(ControlResult{Error: "会话正忙，请重试"})
+				}
+			}
+			m.mu.Unlock()
 		case "stop":
 			m.stop(cmd.VM)
 		case "probe":

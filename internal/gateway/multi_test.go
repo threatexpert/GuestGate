@@ -15,6 +15,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 
+	"guestgate/internal/upstream"
 	"guestgate/internal/vmnet"
 )
 
@@ -124,7 +125,11 @@ func TestTwoGuestsWaitForOwnSOCKSReply(t *testing.T) {
 	attach := func(mac byte, server string) (*gateway, func()) {
 		ctx, cancel := context.WithCancel(context.Background())
 		g := &gateway{activity: new(activityBatch), addresses: gatewayAddresses{subnet: netip.MustParsePrefix("192.168.7.0/24")}, guest: net.HardwareAddr{0, 12, 41, 0, 0, mac}, mac: gatewayMAC(ip), ip: ip, link: channel.New(64, 1500, "")}
-		_, closeStack, err := g.startStack(ctx, server, "", "")
+		client, err := upstream.Parse(server)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, closeStack, err := g.startStack(ctx, client)
 		if err != nil {
 			t.Fatal(err)
 		}

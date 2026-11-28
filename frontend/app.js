@@ -19,6 +19,18 @@ let selected = "", states = {}, refreshBusy = false, stateRequest = 0;
 let hasMachineList = false;
 let activeOnly = false, formMode = "";
 
+const proxyEditor = createProxyEditor(fields.proxy, el("proxy-eye"), value => {
+  const row = machines.get(selected);
+  if (!row?.loaded || fields.proxy.disabled) return;
+  row.prefs.Proxy = value;
+  row.error = ""; save(row); paintForm();
+});
+
+// Preserve native paths for VMware, profiles and file I/O.
+function displayPath(path = "") {
+  return path.replace(/\\\\\?\\UNC\\/gi, "\\\\").replace(/\\\\\?\\(?=[a-z]:\\)/gi, "");
+}
+
 function setText(node, text) {
   if (node.textContent !== text) node.textContent = text;
 }
@@ -39,12 +51,13 @@ function paintForm(fill = false) {
   const vm = row.vm, state = states[row.key];
   const mode = row.key + (state?.Running ? "/active" : "/idle");
   if (mode !== formMode) {
+    proxyEditor.hide();
     el("config").open = !state?.Running;
     formMode = mode;
   }
   el("config").classList.toggle("active-config", !!state?.Running);
   setText(el("selected-name"), vm.Name);
-  setText(el("selected-path"), vm.Path);
+  setText(el("selected-path"), displayPath(vm.Path));
   el("encrypted-note").hidden = !vm.Encrypted;
   const isolated = !row.prefs.AllowHostAccess;
   const switching = vm.NeedsSwitch;
@@ -55,14 +68,16 @@ function paintForm(fill = false) {
     ? "启用时将网卡从 " + vm.CurrentNetwork + " 切换到共享仅主机网络（VMnet1）。"
     : "共享仅主机网络 · " + vm.Network + "　 网卡 " + vm.MAC);
   if (fill) {
-    fields.proxy.value = row.prefs.Proxy;
+    proxyEditor.set(row.prefs.Proxy);
     fields.dns.value = row.prefs.DNS;
     fields.rest.value = row.prefs.RESTPassword;
     fields.blockHost.checked=isolated;
+    fields.recordTraffic.checked=!!row.prefs.RecordTraffic;
     fields.confirmExit.checked=!row.prefs.SkipExitConfirmation;
   }
   const locked = !row.loaded || row.busy || state?.Running || !row.present;
-  for (const input of [fields.proxy, fields.dns, fields.rest, fields.blockHost, fields.confirmExit]) input.disabled = !!locked;
+  for (const input of [fields.proxy, fields.dns, fields.rest, fields.blockHost, fields.confirmExit, fields.recordTraffic]) input.disabled = !!locked;
+  el("capture-help").hidden=!row.prefs.RecordTraffic;
   el("switch-note").hidden = !!state?.Running;
   setText(el("switch-note"), isolated
     ? "停止代理后，虚拟机无法直接上外网，也无法访问宿主机端口。"
@@ -78,6 +93,7 @@ function paintForm(fill = false) {
 }
 
 function choose(key) {
+  proxyEditor.set("");
   selected = key;
   for (const [k,r] of machines) r.tile.setAttribute("aria-pressed",String(k===key));
   paintForm(true);
@@ -118,6 +134,7 @@ async function load(row) {
     row.loaded=true;
   } catch(e) {row.error="读取配置失败："+String(e);}
   if (selected===row.key) paintForm(true);
+  if (el("capture-dialog").open && captureRow === row) refreshRecordingLocations();
 }
 
 function add(vm,key) {
@@ -147,10 +164,10 @@ function drawTiles() {
     count++;
     if (!tile.hidden) visible.push(key);
     tile.classList.toggle("has-session",running);
-    tile.title=vm.Path;
+    tile.title=displayPath(vm.Path);
     setText(tile.querySelector("strong"), vm.Name);
     setText(tile.querySelector("small"), states[key]?.Running ? sessionBadge(states[key]).text : vm.CurrentNetwork);
-    setText(tile.querySelector(".tile-path"), names.get(vm.Name)>1 ? vm.Path : "");
+    setText(tile.querySelector(".tile-path"), names.get(vm.Name)>1 ? displayPath(vm.Path) : "");
   }
   setText(el("count"), hasMachineList ? String(count) : "");
   setText(el("active-count"), String(active));
@@ -186,6 +203,7 @@ function createCard(key,state) {
       if (states[key]) showTelemetry(card,states[key]);
     }
   };
+  bindSessionControls(card,key);
   cards.set(key,card);
   el("sessions").prepend(card);
   return card;
@@ -222,11 +240,11 @@ function showTelemetry(card, state) {
     const labels = {ok:key === "Service" ? "正常" : "可用", error:key === "Service" ? "异常" : "探测失败", unsupported:"不支持", blocked:"未执行", probing:"探测中"};
     row.dataset.state = probing ? "probing" : result?.State || "pending";
     setText(row.querySelector("b"), labels[row.dataset.state] || "未探测");
-    setText(row.querySelector("small"), probing ? "" : result?.Detail || (result?.State === "blocked" ? "SOCKS5 服务检查失败" : ""));
+    setText(row.querySelector("small"), probing ? "" : result?.Detail || (result?.State === "blocked" ? "上游代理服务检查失败" : ""));
   }
   const checked = !probing && health?.CheckedAt ? "上次探测 " + new Date(health.CheckedAt * 1000).toLocaleTimeString("zh-CN",{hour12:false}) + " · " : "";
-  setLiveText(panel.querySelector(".check-note"), checked + "TCP / UDP 探测目标 " + stats.DNS + ":53");
-  setLiveText(panel.querySelector(".dial-error"), stats.LastTCPError ? "最近一次虚拟机 TCP 连接失败 · " + stats.LastTCPError : "");
+  setLiveText(panel.querySelector(".check-note"), checked + (stats.Server.startsWith("http://") ? "TCP 探测目标 " : "TCP / UDP 探测目标 ") + stats.DNS + ":53");
+  setLiveText(panel.querySelector(".dial-error"), stats.LocalTCPError ? "本机 TCP 连接异常 · " + stats.LocalTCPError : "");
 }
 
 function drawSessions() {
@@ -239,11 +257,12 @@ function drawSessions() {
     if (card.dataset.phase !== state.Phase) setup.open = state.Phase === "starting" || state.Phase === "error";
     card.dataset.phase=state.Phase;
     setText(card.querySelector("h3"), vm?.Name || key.split(/[\\/]/).pop());
-    setText(card.querySelector(".path"), vm?.Path || key);
+    setText(card.querySelector(".path"), displayPath(vm?.Path || key));
     const done=state.Steps.filter(s=>s.State==="done" || s.State==="skipped").length;
     const badge = sessionBadge(state);
     card.dataset.tone = badge.tone;
     setText(card.querySelector(".phase"), badge.text);
+    paintSessionControls(card,state);
     card.querySelector(".isolation-status").hidden = !(state.Running && state.Phase === "ready");
     setText(card.querySelector(".isolation-status span"), state.IsolatedNetwork ? "专用隔离网络 · 外网仅经代理，宿主机端口已阻断" : "共享仅主机网络 · 未阻断宿主机端口访问");
     const help = card.querySelector(".guest-help");
@@ -270,8 +289,12 @@ function drawSessions() {
         icon.querySelector("path").setAttribute("d", path);
       }
       setText(node.children[1], step.Title);
-      const plannedSwitch = i===1 && vm && (row?.prefs.AllowHostAccess ? vm.NeedsSwitch : !vm.IsOwnNetwork) && step.State==="pending"
-        ? vm.CurrentNetwork+(!row?.prefs.AllowHostAccess ? " → 专用隔离网络" : " → 共享仅主机网络（VMnet1）") : "";
+      let plannedSwitch = "";
+      if (i === 1 && vm && step.State === "pending" && (row.prefs.AllowHostAccess ? vm.NeedsSwitch : !vm.IsOwnNetwork)) {
+        const current = (vm.CurrentNetwork || "当前网络").replace(/^vmnet/i, "VMnet");
+        const target = row.prefs.AllowHostAccess ? "共享仅主机网络（VMnet1）" : "专用隔离网络";
+        plannedSwitch = "将把虚拟机网卡从 " + current + " 切换到" + target + "。";
+      }
       setLiveText(node.children[3], step.Detail || plannedSwitch);
     });
   }
@@ -280,13 +303,103 @@ function drawSessions() {
 form.oninput=()=>{
   const row=machines.get(selected);
   if (!row?.loaded) return;
-  row.prefs={Proxy:fields.proxy.value,DNS:fields.dns.value,RESTPassword:fields.rest.value,AllowHostAccess:!fields.blockHost.checked,SkipExitConfirmation:!fields.confirmExit.checked};
+  row.prefs={...row.prefs,DNS:fields.dns.value,RESTPassword:fields.rest.value,AllowHostAccess:!fields.blockHost.checked,SkipExitConfirmation:!fields.confirmExit.checked,RecordTraffic:fields.recordTraffic.checked};
   row.error=""; save(row);paintForm();
 };
+el("export-ca").onclick=async()=>{
+  const button=el("export-ca"), result=el("capture-result");
+  button.disabled=true;
+  try {
+    const upgrade=await api.HostCANeedsUpgrade();
+    if(upgrade){
+      const dialog=el("upgrade-ca");
+      dialog.returnValue="";
+      const closed=new Promise(resolve=>dialog.addEventListener("close",resolve,{once:true}));
+      dialog.showModal();
+      await closed;
+      if(dialog.returnValue!=="upgrade")return;
+    }
+    const path=await api.ExportHostCA(upgrade); setText(result,"所有虚拟机共用此证书："+displayPath(path)); }
+  catch(e){setText(result,String(e));}
+  finally{button.disabled=false;}
+};
+let captureRow, locationRequest = 0;
+function showCaptureSettings() {
+  captureRow = machines.get(selected);
+  setText(el("capture-result"), "");
+  setText(el("capture-storage-status"), "");
+  setText(el("capture-target"), captureRow ? captureRow.vm.Name + " · " + displayPath(captureRow.vm.Path) : "选择一台虚拟机后，可设置它的录制位置。");
+  el("capture-dialog").showModal();
+  refreshRecordingLocations();
+}
+async function refreshRecordingLocations() {
+  const row = captureRow, ticket = ++locationRequest;
+  const root = row?.prefs.RecordingRoot || "";
+  el("open-recordings").disabled = el("choose-recordings").disabled = true;
+  el("reset-recordings").hidden = el("legacy-recordings").hidden = true;
+  el("capture-location-help").hidden = !row;
+  setText(el("capture-directory"), row ? "正在读取目录…" : "");
+  if (!row?.loaded) {
+    if (row?.error) setText(el("capture-directory"), row.error);
+    return;
+  }
+  try {
+    const paths = await api.RecordingLocations(row.vm.Path, root);
+    if (ticket !== locationRequest) return;
+    setText(el("capture-directory"), displayPath(paths.Directory));
+    el("legacy-recordings").hidden = !paths.Legacy;
+    el("legacy-recordings").title = displayPath(paths.Legacy || "");
+    el("open-recordings").disabled = false;
+  } catch (e) {
+    if (ticket === locationRequest) setText(el("capture-directory"), String(e));
+  } finally {
+    if (ticket === locationRequest) {
+      el("choose-recordings").disabled = false;
+      el("reset-recordings").hidden = !root;
+    }
+  }
+}
+async function changeRecordingLocation(reset) {
+  const row = captureRow;
+  if (!row?.loaded) return;
+  el("choose-recordings").disabled = el("reset-recordings").disabled = true;
+  setText(el("capture-storage-status"), "");
+  const previous = row.prefs.RecordingRoot || "";
+  try {
+    const root = reset ? "" : await api.ChooseRecordingRoot(row.vm.Path, previous);
+    if ((!reset && !root) || root === previous) return;
+    row.prefs.RecordingRoot = root;
+    try { await save(row); }
+    catch (e) { row.prefs.RecordingRoot = previous; throw e; }
+    if (captureRow === row) setText(el("capture-storage-status"), "已保存，下次录制使用此位置。");
+  } catch (e) {
+    if (captureRow === row) setText(el("capture-storage-status"), String(e));
+  } finally {
+    if (captureRow === row) {
+      el("reset-recordings").disabled = false;
+      refreshRecordingLocations();
+    }
+  }
+}
+el("choose-recordings").onclick = () => changeRecordingLocation(false);
+el("reset-recordings").onclick = () => changeRecordingLocation(true);
+async function openRecordingLocation(legacy) {
+  const row = captureRow;
+  if (!row) return;
+  try {
+    if (legacy) await api.OpenLegacyRecordings(row.vm.Path);
+    else await api.OpenRecordings(row.vm.Path, row.prefs.RecordingRoot || "");
+  } catch (e) {
+    if (captureRow === row) setText(el("capture-storage-status"), String(e));
+  }
+}
+el("open-recordings").onclick = () => openRecordingLocation(false);
+el("legacy-recordings").onclick = () => openRecordingLocation(true);
 form.onsubmit=async event=>{
   event.preventDefault();
   const row=machines.get(selected);
   if (!row || el("start").disabled) return;
+  proxyEditor.hide();
   row.busy=true;row.error="";paintForm();
   try {
     await save(row);
@@ -339,7 +452,7 @@ async function updateStates() {
     const old=states[key];
     return (old?.Running && !s.Running) || (s.Steps[1].State==="done" && old?.Steps[1].State!=="done");
   });
-  states=next;drawSessions();drawTiles();paintForm();
+  states=next;syncConnectionDialog();drawSessions();drawTiles();paintForm();
   if (networkChanged) refresh();
 }
 
@@ -354,6 +467,7 @@ el("about-version").textContent=el("app-version").textContent;
 for (const link of document.querySelectorAll('a[aria-haspopup="dialog"]')) {
   link.onclick=event=>{
     event.preventDefault();
+    if (link.getAttribute("aria-controls") === "capture-dialog") { showCaptureSettings(); return; }
     if (link.getAttribute("aria-controls") === "node-ports-dialog") setText(el("node-ports-status"), "");
     el(link.getAttribute("aria-controls")).showModal();
   };
@@ -363,7 +477,7 @@ el("copy-node-ports").onclick=async()=>{
     await window.runtime.ClipboardSetText(await api.ClashNodePortsScript());
     setText(el("node-ports-status"), "脚本已复制");
   } catch (e) {
-    setText(el("node-ports-status"), "复制失败，请使用发布包里的 integrations/clash/node-ports.js");
+    setText(el("node-ports-status"), "复制失败，请使用发布包里的 integrations/clash-node-ports.js");
   }
 };
 el("about-project").onclick=event=>{
@@ -387,7 +501,7 @@ function showCleanup(report) {
     const item=document.createElement("li"), name=document.createElement("strong");
     const path=document.createElement("small"), detail=document.createElement("p");
     name.textContent=row?.vm.Name || key.split(/[\\/]/).pop();
-    path.className="path";path.textContent=row?.vm.Path || key;
+    path.className="path";path.textContent=displayPath(row?.vm.Path || key);
     detail.textContent=status;
     item.append(name,path,detail);
     return item;
@@ -402,4 +516,6 @@ function showCleanup(report) {
 el("closing").oncancel=event=>event.preventDefault();
 el("close-finish").onclick=()=>window.runtime.Quit();
 window.runtime.EventsOn("guestgate:closing",showCleanup);
+initRouteDialog();
+initConnectionDialog();
 refresh();poll();

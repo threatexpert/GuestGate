@@ -15,7 +15,7 @@ func TestPreferencesSurviveRestartAndDuplicateNames(t *testing.T) {
 	if p, err := Load(first); err != nil || p != nil {
 		t.Fatal("new profile", err)
 	}
-	a := Preferences{Proxy: "socks5://alice:secret@127.0.0.1:1080", DNS: "8.8.8.8", RESTPassword: "rest-secret", AllowHostAccess: true, SkipExitConfirmation: true}
+	a := Preferences{Proxy: "socks5://alice:secret@127.0.0.1:1080", DNS: "8.8.8.8", RESTPassword: "rest-secret", AllowHostAccess: true, SkipExitConfirmation: true, RecordingRoot: t.TempDir()}
 	b := Preferences{Proxy: "localhost:1081", DNS: "1.1.1.1"}
 	if err := Save(first, a); err != nil {
 		t.Fatal(err)

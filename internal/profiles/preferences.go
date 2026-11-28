@@ -1,7 +1,6 @@
 package profiles
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -9,15 +8,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"guestgate/internal/usersecret"
 )
 
 type Preferences struct {
 	Proxy, DNS, RESTPassword string
 	AllowHostAccess          bool
 	SkipExitConfirmation     bool
+	RecordTraffic            bool
+	RecordingRoot            string
 }
 
 // Key by the full VMX path. Display names and VMX basenames can both repeat.
@@ -33,25 +35,6 @@ func preferencePath(vm string) (string, error) {
 	return filepath.Join(dir, "GuestGate", "profiles", fmt.Sprintf("%x.dat", key)), nil
 }
 
-func protectPreferences(data []byte, encrypt bool) ([]byte, error) {
-	if len(data) == 0 {
-		return nil, errors.New("虚拟机配置文件为空")
-	}
-	in := windows.DataBlob{Size: uint32(len(data)), Data: &data[0]}
-	var out windows.DataBlob
-	var err error
-	if encrypt {
-		err = windows.CryptProtectData(&in, nil, nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out)
-	} else {
-		err = windows.CryptUnprotectData(&in, nil, nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer windows.LocalFree(windows.Handle(uintptr(unsafe.Pointer(out.Data))))
-	return bytes.Clone(unsafe.Slice(out.Data, out.Size)), nil
-}
-
 // A missing profile is distinct from a saved draft with an empty field.
 func Load(vm string) (*Preferences, error) {
 	path, err := preferencePath(vm)
@@ -65,7 +48,7 @@ func Load(vm string) (*Preferences, error) {
 	if err != nil {
 		return nil, err
 	}
-	cleartext, err := protectPreferences(raw, false)
+	cleartext, err := usersecret.Protect(raw, false)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +68,7 @@ func Save(vm string, p Preferences) error {
 	if err != nil {
 		return err
 	}
-	raw, err = protectPreferences(raw, true)
+	raw, err = usersecret.Protect(raw, true)
 	if err != nil {
 		return err
 	}

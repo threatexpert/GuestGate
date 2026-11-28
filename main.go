@@ -22,7 +22,7 @@ import (
 // Keep the public Wails binding at window.go.main.App.
 type App struct{ *desktop.App }
 
-//go:embed integrations/clash/node-ports.js
+//go:embed integrations/clash-node-ports.js
 var clashNodePortsScript string
 
 func (*App) ClashNodePortsScript() string { return clashNodePortsScript }

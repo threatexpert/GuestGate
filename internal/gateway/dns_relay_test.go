@@ -7,16 +7,17 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/xjasonlyu/tun2socks/v2/transport/socks5"
-	"golang.org/x/net/proxy"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 
 	"guestgate/internal/dnsrelay"
+	"guestgate/internal/upstream"
 )
 
 func dnsListener(t *testing.T) *net.TCPListener {
@@ -87,7 +88,15 @@ func dnsStack(t *testing.T, l *net.TCPListener, user, password string) (*gateway
 	t.Helper()
 	ip := netip.MustParseAddr("192.168.7.2")
 	g := &gateway{activity: new(activityBatch), guest: net.HardwareAddr{0, 12, 41, 0, 0, 1}, mac: gatewayMAC(ip), ip: ip, link: channel.New(64, 1500, "")}
-	handler, stop, err := g.startStack(t.Context(), l.Addr().String(), user, password)
+	u := &url.URL{Scheme: "socks5", Host: l.Addr().String()}
+	if user != "" {
+		u.User = url.UserPassword(user, password)
+	}
+	client, err := upstream.Parse(u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, stop, err := g.startStack(t.Context(), client)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,11 +380,11 @@ func TestDNSUDPTimeoutRetriesOverTCP(t *testing.T) {
 	l := dnsListener(t)
 	u := testUDPRelay(t)
 	ctx, cancel := context.WithCancel(t.Context())
-	d, err := proxy.SOCKS5("tcp", l.Addr().String(), nil, proxy.Direct)
+	d, err := upstream.Parse(l.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := dnsrelay.New(ctx, l.Addr().String(), nil, d.(proxy.ContextDialer))
+	r := dnsrelay.New(ctx, d)
 	defer func() { cancel(); <-r.Done() }()
 	q := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1}
 	target := netip.MustParseAddrPort("1.1.1.1:53")

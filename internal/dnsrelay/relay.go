@@ -14,18 +14,17 @@ import (
 	"time"
 
 	"github.com/xjasonlyu/tun2socks/v2/transport/socks5"
-	"golang.org/x/net/proxy"
+
+	"guestgate/internal/upstream"
 )
 
 // Each guest owns one DNS relay. Only a probe can enable UDP forwarding.
 type Relay struct {
-	ctx    context.Context
-	server string
-	auth   *proxy.Auth
-	tcp    proxy.ContextDialer
-	demand chan struct{}
-	first  sync.Once
-	done   chan struct{}
+	ctx      context.Context
+	upstream *upstream.Client
+	demand   chan struct{}
+	first    sync.Once
+	done     chan struct{}
 
 	mu       sync.Mutex
 	current  *dnsAssociation
@@ -34,8 +33,8 @@ type Relay struct {
 	changed  chan struct{}
 }
 
-func New(ctx context.Context, server string, auth *proxy.Auth, tcp proxy.ContextDialer) *Relay {
-	r := &Relay{ctx: ctx, server: server, auth: auth, tcp: tcp, demand: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{})}
+func New(ctx context.Context, client *upstream.Client) *Relay {
+	r := &Relay{ctx: ctx, upstream: client, demand: make(chan struct{}), done: make(chan struct{}), changed: make(chan struct{})}
 	go r.run()
 	return r
 }
@@ -59,9 +58,13 @@ func (r *Relay) run() {
 	const minDelay = 100 * time.Millisecond
 	delay := minDelay
 	for r.ctx.Err() == nil {
-		a, err := openDNSAssociation(r.ctx, r.server, r.auth)
+		control, udp, err := r.upstream.Associate(r.ctx)
+		var a *dnsAssociation
+		if err == nil {
+			a = newDNSAssociation(control, udp)
+		}
 		r.publish(a, err)
-		if errors.Is(err, errUDPUnsupported) {
+		if errors.Is(err, upstream.ErrUDPUnsupported) {
 			select {
 			case <-r.ctx.Done():
 				return
@@ -96,7 +99,7 @@ func (r *Relay) Exchange(ctx context.Context, target netip.AddrPort, query []byt
 	a := r.verified
 	r.mu.Unlock()
 	if a == nil {
-		return exchangeTCPDNS(ctx, r.tcp, target.String(), query)
+		return exchangeTCPDNS(ctx, r.upstream, target.String(), query)
 	}
 	udpCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	reply, udpErr := a.exchange(udpCtx, target, query)
@@ -112,7 +115,7 @@ func (r *Relay) Exchange(ctx context.Context, target netip.AddrPort, query []byt
 		r.verified = nil
 	}
 	r.mu.Unlock()
-	reply, tcpErr := exchangeTCPDNS(ctx, r.tcp, target.String(), query)
+	reply, tcpErr := exchangeTCPDNS(ctx, r.upstream, target.String(), query)
 	if tcpErr != nil {
 		return nil, fmt.Errorf("UDP DNS 转发失败（%v），TCP DNS 重试失败：%w", udpErr, tcpErr)
 	}
@@ -122,6 +125,9 @@ func (r *Relay) Exchange(ctx context.Context, target netip.AddrPort, query []byt
 // ProbeUDP verifies a DNS round trip on the current association. A successful
 // SOCKS5 handshake alone does not establish that UDP datagrams can get back.
 func (r *Relay) ProbeUDP(ctx context.Context, target netip.AddrPort) error {
+	if r.upstream.Scheme == "http" {
+		return upstream.ErrHTTPUDPUnsupported
+	}
 	r.first.Do(func() { close(r.demand) })
 	for {
 		r.mu.Lock()

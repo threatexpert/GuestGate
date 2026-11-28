@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"guestgate/internal/upstream"
 )
 
 type CheckResult struct {
@@ -25,6 +27,9 @@ func rootNSQuery() []byte {
 // Check verifies the SOCKS listener independently of either path to the guest's
 // resolver. A UDP check must never succeed through the TCP DNS fallback.
 func (r *Relay) Check(parent context.Context, dns netip.Addr) Health {
+	if r.upstream.Scheme == "http" {
+		return r.checkHTTP(parent, dns)
+	}
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	service := r.checkService(ctx)
 	cancel()
@@ -40,7 +45,7 @@ func (r *Relay) Check(parent context.Context, dns netip.Addr) Health {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, tcpErr = exchangeTCPDNS(ctx, r.tcp, target.String(), query)
+			_, tcpErr = exchangeTCPDNS(ctx, r.upstream, target.String(), query)
 		}()
 		udpErr := r.ProbeUDP(ctx, target)
 		wg.Wait()
@@ -60,30 +65,41 @@ func (r *Relay) Check(parent context.Context, dns netip.Addr) Health {
 }
 
 func (r *Relay) checkService(ctx context.Context) CheckResult {
-	var d net.Dialer
-	c, err := d.DialContext(ctx, "tcp", r.server)
-	if err != nil {
-		return CheckResult{"error", "无法连接上游端口 · " + err.Error()}
-	}
-	defer c.Close()
-	stop := context.AfterFunc(ctx, func() { c.Close() })
-	defer stop()
-	if deadline, ok := ctx.Deadline(); ok {
-		c.SetDeadline(deadline)
-	}
-	if err := negotiate(c, r.auth); err != nil {
-		return CheckResult{"error", "端口可达，SOCKS5 握手或认证失败 · " + err.Error()}
+	if err := r.upstream.CheckSOCKS(ctx); err != nil {
+		return pathResult(err)
 	}
 	return CheckResult{"ok", "端口可达，SOCKS5 握手通过"}
+}
+
+func (r *Relay) checkHTTP(parent context.Context, dns netip.Addr) Health {
+	ctx, cancel := context.WithTimeout(parent, 6*time.Second)
+	defer cancel()
+	h := Health{UDP: CheckResult{"unsupported", "HTTP CONNECT 仅支持 TCP，DNS 使用 TCP"}}
+	conn, err := r.upstream.DialContext(ctx, "tcp", netip.AddrPortFrom(dns, 53).String())
+	if err != nil {
+		h.Service = pathResult(err)
+		var status upstream.HTTPStatusError
+		if errors.As(err, &status) && (status == 403 || status >= 500) {
+			h.Service = CheckResult{"ok", "上游已响应 HTTP CONNECT 请求"}
+		}
+		h.TCP = pathResult(err)
+	} else {
+		defer conn.Close()
+		h.Service = CheckResult{"ok", "HTTP CONNECT 隧道已建立"}
+		_, err = queryDNSConn(ctx, conn, rootNSQuery())
+		h.TCP = pathResult(err)
+	}
+	h.CheckedAt = time.Now().Unix()
+	return h
 }
 
 func pathResult(err error) CheckResult {
 	switch {
 	case err == nil:
 		return CheckResult{State: "ok"}
-	case errors.Is(err, errUDPAssociateEOF):
+	case errors.Is(err, upstream.ErrUDPAssociateEOF):
 		return CheckResult{"unsupported", "上游收到 UDP ASSOCIATE 后直接关闭连接（EOF），DNS 自动使用 TCP"}
-	case errors.Is(err, errUDPUnsupported):
+	case errors.Is(err, upstream.ErrUDPUnsupported):
 		return CheckResult{"unsupported", "上游不支持 UDP ASSOCIATE，DNS 自动使用 TCP"}
 	default:
 		return CheckResult{"error", err.Error()}

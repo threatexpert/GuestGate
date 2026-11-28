@@ -9,12 +9,12 @@
     const key = entry.VM.toLowerCase(), vm = machines.get(key)?.vm;
     const source = vm?.Name || entry.VM.split(/[\\/]/).pop() || "GuestGate";
     const timestamp = new Date(entry.Time).toLocaleTimeString("zh-CN", {hour12:false});
-    for (const text of [timestamp, source, entry.Kind, entry.Message]) {
+    for (const text of [timestamp, source, entry.Kind, entry.Kind === "录制" ? displayPath(entry.Message) : entry.Message]) {
       const cell = document.createElement("span");
       cell.textContent = text;
       row.append(cell);
     }
-    row.children[1].title = entry.VM || source;
+    row.children[1].title = displayPath(entry.VM || source);
     return row;
   }
   async function read(ticket) {
